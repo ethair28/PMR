@@ -20,6 +20,9 @@ What is implemented now:
 - A live Polymarket provider that fetches active markets from Gamma, price history from the public CLOB API, and open interest from the public Data API.
 - A local SQLite snapshot store with retention pruning for live Polymarket runs.
 - Category and liquidity filters focused on politics, geopolitics, economics, and macro.
+- Soft universe selection with category floors plus global overflow instead of rigid equal caps.
+- Explicit exclusion of public-market-proxy contracts such as gold, oil, and Bitcoin price-threshold markets.
+- Story-family deduping so related contract variants collapse into one final research candidate.
 - A Markdown report generator.
 - A research-input JSON exporter for downstream agent workflows.
 - A sample-data runner so the pipeline works locally without external credentials.
@@ -60,7 +63,8 @@ python3 main.py \
   --polymarket-max-markets 100 \
   --polymarket-max-pages 20 \
   --output-markdown out/report.md \
-  --output-research-json out/research-inputs.json
+  --output-research-json out/research-inputs.json \
+  --output-scan-json out/scan-diagnostics.json
 ```
 
 If you want a reproducible local snapshot store as you evaluate live runs:
@@ -70,7 +74,8 @@ python3 main.py \
   --source polymarket \
   --db-path data/pmr.sqlite3 \
   --snapshot-retention-days 120 \
-  --max-markets-per-category 25 \
+  --min-markets-per-category 5 \
+  --max-category-share 0.6 \
   --polymarket-refresh-mode incremental \
   --output-research-json out/research-inputs.json
 ```
@@ -112,15 +117,17 @@ python3 main.py \
 This live path currently uses:
 
 - Gamma API for active market discovery
-- CLOB `prices-history` for token probability history
+- CLOB `prices-history` for token probability history, fetched in bounded chunks so longer retained windows do not trip the API span limit
 - Data API `/oi` for open interest
 
 The Polymarket provider currently favors transparency over sophistication:
 
 - it scans active markets ordered by recent volume,
 - infers target categories from market text,
+- excludes asset-price and futures-style contracts that mostly mirror public market data,
 - fetches the tracked outcome history for binary markets,
-- caps the number of selected markets per category so politics does not crowd out macro or geopolitics,
+- guarantees small category coverage floors, then fills the rest of the universe by the strongest markets overall,
+- applies a soft category-share brake instead of forcing equal caps,
 - and adapts those into `MarketSeries` objects for the detector.
 
 The local dataset is kept bounded by:
@@ -131,6 +138,24 @@ The local dataset is kept bounded by:
 - and dropping stale markets that have not been refreshed recently.
 
 When you run `--source polymarket`, PMR first fetches the live delta or backfill chunk, writes it into SQLite, prunes old data, and then runs detection on the merged stored dataset. That keeps reports stable while avoiding repeated full-history pulls.
+
+The live Polymarket report now appends a diagnostics section that explains:
+
+- how many pages and payloads were scanned,
+- how many markets matched the topical filter,
+- how many histories were requested,
+- how many markets survived selection into storage,
+- and the main rejection reasons for excluded markets.
+
+If you want the same information as structured JSON, use `--output-scan-json`.
+
+The detector also dedupes related market variants before the final ranked output:
+
+- same-story election winner contracts,
+- threshold ladders such as multiple gold or oil strike markets,
+- and other markets that share the same Polymarket event title.
+
+This keeps the research queue closer to one item per story instead of one item per contract.
 
 ## JSON Input Shape
 
@@ -215,12 +240,15 @@ This keeps the system usable for new Polymarket markets without pretending short
 Core modules:
 
 - `pmr/config.py`: runtime thresholds and category rules.
+- `pmr/market_filters.py`: explicit universe-level exclusion rules.
 - `pmr/models.py`: shared dataclasses for the pipeline.
 - `pmr/detector.py`: weekly event extraction, baseline normalization, and ranking.
 - `pmr/polymarket.py`: public Polymarket HTTP client.
 - `pmr/providers.py`: provider interfaces plus local mock/json implementations.
 - `pmr/research_payloads.py`: JSON serialization for downstream research-agent jobs.
+- `pmr/story_groups.py`: story-family keys used for deduping related markets.
 - `pmr/storage.py`: SQLite snapshot persistence, bounded retention, and stored-data loading.
+- `pmr/universe_selection.py`: soft category-floor and overflow-based universe selection.
 - `pmr/pipeline.py`: orchestration.
 - `pmr/reporting.py`: Markdown report rendering.
 - `pmr/sample_data.py`: deterministic local demo dataset.
@@ -229,9 +257,9 @@ Core modules:
 
 The highest-value next milestones are:
 
-1. Tighten topical filtering and market selection so live runs focus more aggressively on politics, geopolitics, and macro.
-2. Add a historical evaluation loop so thresholds can be calibrated against real weeks of Polymarket behavior.
-3. Add a research provider that queries both the web and X, then produces evidence-ranked explanations.
+1. Add a research provider that queries both the web and X, then produces evidence-ranked explanations.
+2. Add a historical evaluation loop so thresholds and exclusion rules can be calibrated against real weeks of Polymarket behavior.
+3. Refine story-family clustering so closely related geopolitical and election markets can be grouped more intelligently before research.
 4. Add scheduling and delivery once the signal quality is stable.
 
 ## Testing

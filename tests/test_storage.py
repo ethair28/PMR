@@ -43,16 +43,60 @@ class SnapshotStoreTests(unittest.TestCase):
             )
 
             loaded = store.load_market_series(
+                target_categories=("politics", "geopolitics", "economics", "macro"),
                 history_days=120,
                 staleness_hours=48,
                 max_markets=10,
-                max_markets_per_category=5,
+                min_markets_per_category=1,
+                max_category_share_of_universe=0.6,
+                max_markets_per_category=None,
                 now=datetime(2026, 3, 23, tzinfo=timezone.utc),
             )
 
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0].market.market_id, "recent-market")
         self.assertTrue(all(snapshot.observed_at >= datetime(2026, 2, 21, tzinfo=timezone.utc) for snapshot in loaded[0].snapshots))
+
+    def test_store_load_skips_public_market_proxy_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "pmr.sqlite3"
+            store = SnapshotStore(db_path)
+            store.initialize()
+
+            public_market_proxy = _build_series(
+                market_id="btc-price-market",
+                category="economics",
+                start=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                probabilities=[0.35, 0.42, 0.51],
+                question="Will Bitcoin reach $80,000 in March?",
+                description="This market will immediately resolve to Yes if any Binance 1 minute candle for BTC/USDT has a final High price equal to or above the listed price.",
+                event_title="What price will Bitcoin hit in March?",
+            )
+            policy_market = _build_series(
+                market_id="fed-market",
+                category="macro",
+                start=datetime(2026, 3, 1, tzinfo=timezone.utc),
+                probabilities=[0.25, 0.30, 0.38],
+                question="Will the Fed cut rates by June?",
+            )
+
+            store.upsert_market_series(
+                [public_market_proxy, policy_market],
+                fetched_at=datetime(2026, 3, 22, tzinfo=timezone.utc),
+            )
+
+            loaded = store.load_market_series(
+                target_categories=("politics", "geopolitics", "economics", "macro"),
+                history_days=120,
+                staleness_hours=48,
+                max_markets=10,
+                min_markets_per_category=1,
+                max_category_share_of_universe=0.6,
+                max_markets_per_category=None,
+                now=datetime(2026, 3, 23, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual([series.market.market_id for series in loaded], ["fed-market"])
 
     def test_store_lists_market_ids_and_snapshot_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -98,12 +142,17 @@ def _build_series(
     *,
     start: datetime,
     probabilities: list[float],
+    question: str | None = None,
+    description: str | None = None,
+    event_title: str | None = None,
 ) -> MarketSeries:
     market = Market(
         market_id=market_id,
-        question=f"Question for {market_id}?",
+        question=question or f"Question for {market_id}?",
         category=category,
         tags=(category,),
+        description=description,
+        event_title=event_title,
         volume_7d_usd=200_000,
         volume_24h_usd=50_000,
         open_interest_usd=70_000,

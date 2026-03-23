@@ -120,6 +120,32 @@ class DetectorTests(unittest.TestCase):
         self.assertFalse(event.eligible_for_ranking)
         self.assertEqual(event.exclusion_reason, "liquidity")
 
+    def test_detect_significant_moves_dedupes_same_story_family(self) -> None:
+        markets = (
+            _build_series(
+                market_id="gold-4500",
+                category="macro",
+                event_title="Will Gold (GC) hit __ by end of March?",
+                probabilities=(
+                    [0.05, 0.05, 0.05, 0.05] * 15
+                    + [0.06, 0.10, 0.22, 0.45, 0.72, 0.88, 0.95, 0.99]
+                ),
+            ),
+            _build_series(
+                market_id="gold-4300",
+                category="macro",
+                event_title="Will Gold (GC) hit __ by end of March?",
+                probabilities=(
+                    [0.03, 0.03, 0.03, 0.03] * 15
+                    + [0.03, 0.08, 0.18, 0.40, 0.68, 0.84, 0.90, 0.93]
+                ),
+            ),
+        )
+
+        events = detect_significant_moves(markets, BASE_CONFIG)
+
+        self.assertEqual(len(events), 1)
+
 
 class PipelineTests(unittest.TestCase):
     def test_pipeline_report_includes_new_detector_fields(self) -> None:
@@ -205,6 +231,7 @@ def _build_series(
     open_interest_usd: float = 90_000,
     start: datetime | None = None,
     interval_hours: int = 24,
+    event_title: str | None = None,
 ) -> MarketSeries:
     start = start or datetime(2026, 1, 1, tzinfo=timezone.utc)
     snapshots = tuple(
@@ -219,6 +246,7 @@ def _build_series(
         question=f"Question for {market_id}?",
         category=category,
         tags=(category,),
+        event_title=event_title,
         volume_7d_usd=volume_7d_usd,
         volume_24h_usd=volume_24h_usd,
         open_interest_usd=open_interest_usd,

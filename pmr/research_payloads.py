@@ -5,6 +5,7 @@ from typing import Any, Sequence
 
 from pmr.config import MonitoringConfig
 from pmr.models import RepricingEvent
+from pmr.story_groups import build_story_family_key, build_story_family_label
 
 
 def build_research_input_payload(
@@ -47,6 +48,10 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
             "tracked_outcome": event.market.tracked_outcome,
             "tracked_token_id": event.market.tracked_token_id,
             "event_title": event.market.event_title,
+        },
+        "story": {
+            "family_key": build_story_family_key(event.market),
+            "family_label": build_story_family_label(event.market),
         },
         "detector": {
             "detection_window_start": event.detection_window_start.isoformat(),

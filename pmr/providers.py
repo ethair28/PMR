@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 import re
 from dataclasses import dataclass
@@ -14,8 +15,14 @@ from pmr.models import (
     RepricingEvent,
     ResearchFinding,
 )
+from pmr.market_filters import classify_universe_market_exclusion
 from pmr.polymarket import PolymarketClient
 from pmr.storage import SnapshotBounds, SnapshotStore
+from pmr.universe_selection import (
+    UniverseCandidate,
+    market_priority_sort_key,
+    prioritize_universe_candidates,
+)
 
 
 class MarketDataProvider(Protocol):
@@ -45,6 +52,59 @@ class JsonFileMarketDataProvider:
         return tuple(_market_series_from_dict(item) for item in payload["markets"])
 
 
+@dataclass(frozen=True, slots=True)
+class PolymarketRejectedMarket:
+    """A sampled market-level rejection emitted during a live Polymarket scan."""
+
+    market_id: str | None
+    question: str | None
+    reason: str
+    category: str | None = None
+    matched_terms: tuple[str, ...] = ()
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PolymarketScanDiagnostics:
+    """Explainable scan summary for a live Polymarket universe fetch."""
+
+    pages_scanned: int
+    payloads_seen: int
+    unique_markets_seen: int
+    topic_matches: int
+    selected_markets: int
+    history_requests: int
+    open_interest_fallbacks: int
+    per_category_selected: dict[str, int]
+    rejection_counts: dict[str, int]
+    sampled_rejections: tuple[PolymarketRejectedMarket, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PolymarketScanResult:
+    """Live provider result containing both selected series and scan diagnostics."""
+
+    markets: tuple[MarketSeries, ...]
+    diagnostics: PolymarketScanDiagnostics
+
+
+@dataclass(frozen=True, slots=True)
+class _BuildMarketSeriesResult:
+    series: MarketSeries | None
+    rejection_reason: str | None = None
+    detail: str | None = None
+    history_requested: bool = False
+    used_open_interest_fallback: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _TopicalPayloadCandidate:
+    payload: dict[str, Any]
+    category: str
+    matched_terms: tuple[str, ...]
+    sort_key: tuple[float, float, float, str]
+
+
 @dataclass(slots=True)
 class PolymarketMarketDataProvider:
     """Fetch live Polymarket markets and adapt them into PMR's market-series model."""
@@ -57,53 +117,198 @@ class PolymarketMarketDataProvider:
     fidelity_minutes: int = 60
     target_categories: tuple[str, ...] = ("politics", "geopolitics", "economics", "macro")
     category_aliases: dict[str, tuple[str, ...]] | None = None
+    min_markets_per_category: int = 5
+    max_category_share_of_universe: float | None = 0.6
     max_markets_per_category: int | None = None
     refresh_mode: str = "full"
     existing_snapshot_bounds: dict[str, SnapshotBounds] | None = None
     incremental_overlap_minutes: int = 180
     backfill_chunk_days: int = 14
     current_time: datetime | None = None
+    diagnostic_sample_size: int = 25
 
     def list_market_series(self) -> Sequence[MarketSeries]:
+        return self.scan_market_series().markets
+
+    def scan_market_series(self) -> PolymarketScanResult:
         markets: list[MarketSeries] = []
         seen_market_ids: set[str] = set()
         per_category_counts: dict[str, int] = {}
-        max_per_category = self.max_markets_per_category or max(
-            1, self.max_markets // max(len(self.target_categories), 1)
-        )
+        rejection_counts: Counter[str] = Counter()
+        sampled_rejections: list[PolymarketRejectedMarket] = []
+        topical_candidates: list[_TopicalPayloadCandidate] = []
+        pages_scanned = 0
+        payloads_seen = 0
+        unique_markets_seen = 0
+        topic_matches = 0
+        history_requests = 0
+        open_interest_fallbacks = 0
+
+        def record_rejection(
+            *,
+            payload: dict[str, Any],
+            reason: str,
+            category: str | None = None,
+            matched_terms: tuple[str, ...] = (),
+            detail: str | None = None,
+        ) -> None:
+            rejection_counts[reason] += 1
+            if len(sampled_rejections) >= self.diagnostic_sample_size:
+                return
+            sampled_rejections.append(
+                PolymarketRejectedMarket(
+                    market_id=_as_optional_str(payload.get("id")),
+                    question=_as_optional_str(payload.get("question")),
+                    reason=reason,
+                    category=category,
+                    matched_terms=matched_terms,
+                    detail=detail,
+                )
+            )
+
+        def selection_rejection_reason() -> tuple[str, str | None]:
+            if self.max_markets_per_category is not None:
+                return "category_cap", "Candidate was trimmed by the configured hard per-category cap."
+            return "selection_overflow", "Candidate fell below the soft floor + global overflow universe cutoff."
+
+        def build_result() -> PolymarketScanResult:
+            return PolymarketScanResult(
+                markets=tuple(markets),
+                diagnostics=PolymarketScanDiagnostics(
+                    pages_scanned=pages_scanned,
+                    payloads_seen=payloads_seen,
+                    unique_markets_seen=unique_markets_seen,
+                    topic_matches=topic_matches,
+                    selected_markets=len(markets),
+                    history_requests=history_requests,
+                    open_interest_fallbacks=open_interest_fallbacks,
+                    per_category_selected=dict(sorted(per_category_counts.items())),
+                    rejection_counts=dict(sorted(rejection_counts.items())),
+                    sampled_rejections=tuple(sampled_rejections),
+                ),
+            )
 
         for page_number in range(self.max_pages):
             offset = page_number * self.page_size
             page = self.client.list_markets(limit=self.page_size, offset=offset)
             if not page:
                 break
+            pages_scanned += 1
+            payloads_seen += len(page)
 
             for payload in page:
                 market_id = str(payload.get("id", ""))
-                if not market_id or market_id in seen_market_ids:
+                if not market_id:
+                    record_rejection(payload=payload, reason="missing_market_id")
+                    continue
+                if market_id in seen_market_ids:
+                    record_rejection(payload=payload, reason="duplicate_market_id")
                     continue
                 seen_market_ids.add(market_id)
+                unique_markets_seen += 1
+                if not payload.get("active") or payload.get("closed"):
+                    record_rejection(payload=payload, reason="inactive_or_closed")
+                    continue
+                if payload.get("sportsMarketType"):
+                    record_rejection(payload=payload, reason="sports_market")
+                    continue
+                exclusion_reason = classify_universe_market_exclusion(
+                    question=_as_optional_str(payload.get("question")),
+                    description=_as_optional_str(payload.get("description")),
+                    slug=_as_optional_str(payload.get("slug")),
+                    event_title=_as_optional_str(payload.get("events", [{}])[0].get("title")) if payload.get("events") else None,
+                )
+                if exclusion_reason is not None:
+                    record_rejection(payload=payload, reason=exclusion_reason)
+                    continue
                 category, matched_terms = self._infer_category(payload)
                 if category is None:
+                    record_rejection(payload=payload, reason="off_topic")
                     continue
-                if per_category_counts.get(category, 0) >= max_per_category:
+                topic_matches += 1
+                if not _has_binary_clob_shape(payload):
+                    record_rejection(
+                        payload=payload,
+                        reason="non_binary_market",
+                        category=category,
+                        matched_terms=matched_terms,
+                    )
                     continue
-
-                try:
-                    series = self._build_market_series(payload, inferred_category=category, matched_terms=matched_terms)
-                except (OSError, KeyError, TypeError, ValueError):
-                    continue
-                if series is None:
-                    continue
-                markets.append(series)
-                per_category_counts[category] = per_category_counts.get(category, 0) + 1
-                if len(markets) >= self.max_markets:
-                    return tuple(markets)
+                topical_candidates.append(
+                    _TopicalPayloadCandidate(
+                        payload=payload,
+                        category=category,
+                        matched_terms=matched_terms,
+                        sort_key=_payload_sort_key(payload),
+                    )
+                )
 
             if len(page) < self.page_size:
                 break
 
-        return tuple(markets)
+        prioritized_candidates = prioritize_universe_candidates(
+            [
+                UniverseCandidate(
+                    item=candidate,
+                    category=candidate.category,
+                    sort_key=candidate.sort_key,
+                )
+                for candidate in topical_candidates
+            ],
+            target_categories=self.target_categories,
+            max_items=self.max_markets,
+            min_items_per_category=self.min_markets_per_category,
+            max_category_share=self.max_category_share_of_universe,
+        )
+
+        for candidate_wrapper in prioritized_candidates:
+            candidate = candidate_wrapper.item
+            if len(markets) >= self.max_markets:
+                reason, detail = selection_rejection_reason()
+                record_rejection(
+                    payload=candidate.payload,
+                    reason=reason,
+                    category=candidate.category,
+                    matched_terms=candidate.matched_terms,
+                    detail=detail,
+                )
+                continue
+
+            if self.max_markets_per_category is not None and (
+                per_category_counts.get(candidate.category, 0) >= self.max_markets_per_category
+            ):
+                reason, detail = selection_rejection_reason()
+                record_rejection(
+                    payload=candidate.payload,
+                    reason=reason,
+                    category=candidate.category,
+                    matched_terms=candidate.matched_terms,
+                    detail=detail,
+                )
+                continue
+
+            build = self._build_market_series(
+                candidate.payload,
+                inferred_category=candidate.category,
+                matched_terms=candidate.matched_terms,
+            )
+            if build.history_requested:
+                history_requests += 1
+            if build.used_open_interest_fallback:
+                open_interest_fallbacks += 1
+            if build.series is None:
+                record_rejection(
+                    payload=candidate.payload,
+                    reason=build.rejection_reason or "build_error",
+                    category=candidate.category,
+                    matched_terms=candidate.matched_terms,
+                    detail=build.detail,
+                )
+                continue
+            markets.append(build.series)
+            per_category_counts[candidate.category] = per_category_counts.get(candidate.category, 0) + 1
+
+        return build_result()
 
     def _build_market_series(
         self,
@@ -111,43 +316,59 @@ class PolymarketMarketDataProvider:
         *,
         inferred_category: str,
         matched_terms: tuple[str, ...],
-    ) -> MarketSeries | None:
+    ) -> _BuildMarketSeriesResult:
         if not payload.get("active") or payload.get("closed"):
-            return None
+            return _BuildMarketSeriesResult(series=None, rejection_reason="inactive_or_closed")
         if payload.get("sportsMarketType"):
-            return None
+            return _BuildMarketSeriesResult(series=None, rejection_reason="sports_market")
 
         outcomes = _parse_string_list(payload.get("outcomes"))
         token_ids = _parse_string_list(payload.get("clobTokenIds"))
         if len(outcomes) != 2 or len(token_ids) != 2:
-            return None
+            return _BuildMarketSeriesResult(series=None, rejection_reason="non_binary_market")
 
         tracked_index = _select_tracked_outcome_index(outcomes)
         tracked_token_id = token_ids[tracked_index]
 
-        end_time = self.current_time or datetime.now(timezone.utc)
-        start_time, end_time = self._determine_history_window(
-            market_id=str(payload["id"]),
-            now=end_time,
-        )
-        if start_time >= end_time:
-            return None
-        history = self.client.get_price_history(
-            token_id=tracked_token_id,
-            start_ts=int(start_time.timestamp()),
-            end_ts=int(end_time.timestamp()),
-            fidelity_minutes=self.fidelity_minutes,
-        )
-        snapshots = tuple(_history_item_to_snapshot(item) for item in history if _is_history_item_usable(item))
-        if len(snapshots) < 2:
-            return None
+        history_requested = False
+        try:
+            end_time = self.current_time or datetime.now(timezone.utc)
+            start_time, end_time = self._determine_history_window(
+                market_id=str(payload["id"]),
+                now=end_time,
+            )
+            if start_time >= end_time:
+                return _BuildMarketSeriesResult(series=None, rejection_reason="invalid_history_window")
+            history_requested = True
+            history = self.client.get_price_history(
+                token_id=tracked_token_id,
+                start_ts=int(start_time.timestamp()),
+                end_ts=int(end_time.timestamp()),
+                fidelity_minutes=self.fidelity_minutes,
+            )
+            snapshots = tuple(_history_item_to_snapshot(item) for item in history if _is_history_item_usable(item))
+            if len(snapshots) < 2:
+                return _BuildMarketSeriesResult(
+                    series=None,
+                    rejection_reason="insufficient_history",
+                    history_requested=True,
+                )
+            condition_id = _as_optional_str(payload.get("conditionId"))
+            open_interest = self.client.get_open_interest(condition_id) if condition_id else None
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            return _BuildMarketSeriesResult(
+                series=None,
+                rejection_reason="build_error",
+                detail=str(exc),
+                history_requested=history_requested,
+            )
 
-        condition_id = _as_optional_str(payload.get("conditionId"))
-        open_interest = self.client.get_open_interest(condition_id) if condition_id else None
         notes: list[str] = []
+        used_open_interest_fallback = False
         if open_interest is None:
             open_interest = _to_float(payload.get("liquidityNum"), default=0.0)
             notes.append("Open interest fell back to Gamma liquidity because Data API open interest was unavailable.")
+            used_open_interest_fallback = True
 
         first_event = payload.get("events", [{}])[0] if payload.get("events") else {}
         slug = _as_optional_str(payload.get("slug"))
@@ -174,10 +395,14 @@ class PolymarketMarketDataProvider:
             volume_24h_usd=_to_float(payload.get("volume24hrClob", payload.get("volume24hr")), default=0.0),
             open_interest_usd=open_interest,
         )
-        return MarketSeries(
-            market=market,
-            snapshots=snapshots,
-            notes="\n".join(notes) if notes else None,
+        return _BuildMarketSeriesResult(
+            series=MarketSeries(
+                market=market,
+                snapshots=snapshots,
+                notes="\n".join(notes) if notes else None,
+            ),
+            history_requested=True,
+            used_open_interest_fallback=used_open_interest_fallback,
         )
 
     def _infer_category(self, payload: dict[str, Any]) -> tuple[str | None, tuple[str, ...]]:
@@ -248,16 +473,22 @@ class StoredMarketDataProvider:
     """Load recent market series from the local SQLite snapshot store."""
 
     store: SnapshotStore
+    target_categories: tuple[str, ...]
     history_days: int
     staleness_hours: int
     max_markets: int
-    max_markets_per_category: int
+    min_markets_per_category: int
+    max_category_share_of_universe: float | None
+    max_markets_per_category: int | None = None
 
     def list_market_series(self) -> Sequence[MarketSeries]:
         return self.store.load_market_series(
+            target_categories=self.target_categories,
             history_days=self.history_days,
             staleness_hours=self.staleness_hours,
             max_markets=self.max_markets,
+            min_markets_per_category=self.min_markets_per_category,
+            max_category_share_of_universe=self.max_category_share_of_universe,
             max_markets_per_category=self.max_markets_per_category,
         )
 
@@ -342,6 +573,21 @@ def _market_series_from_dict(payload: dict) -> MarketSeries:
         snapshots=snapshots,
         research_hints=tuple(payload.get("research_hints", ())),
         notes=payload.get("notes"),
+    )
+
+
+def _has_binary_clob_shape(payload: dict[str, Any]) -> bool:
+    outcomes = _parse_string_list(payload.get("outcomes"))
+    token_ids = _parse_string_list(payload.get("clobTokenIds"))
+    return len(outcomes) == 2 and len(token_ids) == 2
+
+
+def _payload_sort_key(payload: dict[str, Any]) -> tuple[float, float, float, str]:
+    return market_priority_sort_key(
+        volume_7d=_to_float(payload.get("volume1wkClob", payload.get("volume1wk")), default=0.0),
+        volume_24h=_to_float(payload.get("volume24hrClob", payload.get("volume24hr")), default=0.0),
+        depth=_to_float(payload.get("liquidityClob", payload.get("liquidityNum")), default=0.0),
+        market_id=_as_optional_str(payload.get("id")) or "",
     )
 
 

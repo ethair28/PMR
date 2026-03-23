@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import unittest
 from datetime import datetime, timedelta, timezone
 from typing import Any, Sequence
+from urllib.error import HTTPError
 
 from pmr.config import MonitoringConfig
 from pmr.detector import detect_significant_moves
+from pmr.polymarket import HttpPolymarketClient
 from pmr.providers import PolymarketMarketDataProvider
 from pmr.research_payloads import build_research_input_payload
 from pmr.storage import SnapshotBounds
@@ -81,12 +84,13 @@ class PolymarketProviderTests(unittest.TestCase):
         self.assertEqual(market_series[0].market.open_interest_usd, 420000.0)
         self.assertEqual(market_series[0].market.category, "macro")
 
-    def test_provider_balances_category_coverage_with_per_category_caps(self) -> None:
+    def test_provider_uses_category_floors_then_global_overflow(self) -> None:
         client = StubPolymarketClient(
             markets=[
                 _market_payload("pol-1", "Will Candidate A win the election?", "Politics question", "condition-pol-1", "token-pol-1"),
                 _market_payload("pol-2", "Will Candidate B win the election?", "Politics question", "condition-pol-2", "token-pol-2"),
                 _market_payload("pol-3", "Will Candidate C win the election?", "Politics question", "condition-pol-3", "token-pol-3"),
+                _market_payload("pol-4", "Will Candidate D win the election?", "Politics question", "condition-pol-4", "token-pol-4"),
                 _market_payload("macro-1", "Will the Fed cut rates this quarter?", "Macro question", "condition-macro-1", "token-macro-1"),
                 _market_payload("geo-1", "US x Iran ceasefire by June?", "Geopolitics question", "condition-geo-1", "token-geo-1"),
             ],
@@ -94,6 +98,7 @@ class PolymarketProviderTests(unittest.TestCase):
                 "token-pol-1": _history_points([0.20, 0.21, 0.22]),
                 "token-pol-2": _history_points([0.30, 0.31, 0.32]),
                 "token-pol-3": _history_points([0.40, 0.41, 0.42]),
+                "token-pol-4": _history_points([0.50, 0.51, 0.52]),
                 "token-macro-1": _history_points([0.35, 0.36, 0.40]),
                 "token-geo-1": _history_points([0.45, 0.46, 0.50]),
             },
@@ -101,29 +106,32 @@ class PolymarketProviderTests(unittest.TestCase):
                 "condition-pol-1": 200000.0,
                 "condition-pol-2": 200000.0,
                 "condition-pol-3": 200000.0,
+                "condition-pol-4": 200000.0,
                 "condition-macro-1": 200000.0,
                 "condition-geo-1": 200000.0,
             },
         )
         provider = PolymarketMarketDataProvider(
             client=client,
-            max_markets=3,
+            max_markets=4,
             page_size=10,
             max_pages=1,
             history_days=30,
             fidelity_minutes=60,
             target_categories=MonitoringConfig().target_categories,
             category_aliases=MonitoringConfig().category_aliases,
-            max_markets_per_category=1,
+            min_markets_per_category=1,
+            max_category_share_of_universe=0.75,
         )
 
         market_series = provider.list_market_series()
 
-        self.assertEqual(len(market_series), 3)
+        self.assertEqual(len(market_series), 4)
         self.assertEqual(
-            {series.market.category for series in market_series},
-            {"politics", "macro", "geopolitics"},
+            {series.market.market_id for series in market_series},
+            {"pol-1", "pol-2", "macro-1", "geo-1"},
         )
+        self.assertEqual([series.market.category for series in market_series].count("politics"), 2)
 
     def test_research_payload_contains_detector_fields(self) -> None:
         client = StubPolymarketClient(
@@ -174,6 +182,7 @@ class PolymarketProviderTests(unittest.TestCase):
         self.assertEqual(len(payload["anomalies"]), 1)
         anomaly = payload["anomalies"][0]
         self.assertEqual(anomaly["market"]["tracked_outcome"], "Yes")
+        self.assertIn("story", anomaly)
         self.assertIn("features", anomaly)
         self.assertIn("baseline_stats", anomaly)
         self.assertIn("normalized_scores", anomaly)
@@ -273,6 +282,134 @@ class PolymarketProviderTests(unittest.TestCase):
             int((earliest_observed_at + timedelta(minutes=180)).timestamp()),
         )
 
+    def test_scan_diagnostics_report_rejection_reasons(self) -> None:
+        client = StubPolymarketClient(
+            markets=[
+                _market_payload(
+                    "good-market",
+                    "Will inflation print below 2.5% this quarter?",
+                    "Macro market about CPI inflation.",
+                    "condition-good",
+                    "token-good",
+                ),
+                {
+                    "id": "off-topic",
+                    "question": "Will ETH break $10k this year?",
+                    "slug": "eth-10k",
+                    "description": "Crypto market",
+                    "outcomes": "[\"Yes\", \"No\"]",
+                    "clobTokenIds": "[\"token-eth-yes\", \"token-eth-no\"]",
+                    "volume24hr": 250000,
+                    "volume1wk": 900000,
+                    "liquidityNum": 300000,
+                    "active": True,
+                    "closed": False,
+                    "events": [{"title": "ETH price"}],
+                },
+                {
+                    "id": "sports-market",
+                    "question": "Lakers vs Celtics",
+                    "slug": "lakers-celtics",
+                    "description": "Sports market",
+                    "outcomes": "[\"Lakers\", \"Celtics\"]",
+                    "clobTokenIds": "[\"sports-a\", \"sports-b\"]",
+                    "volume24hr": 500000,
+                    "volume1wk": 1200000,
+                    "liquidityNum": 400000,
+                    "active": True,
+                    "closed": False,
+                    "sportsMarketType": "moneyline",
+                    "events": [{"title": "Lakers vs Celtics"}],
+                },
+                _market_payload(
+                    "thin-history",
+                    "Will tariffs rise this quarter?",
+                    "Economics market",
+                    "condition-thin",
+                    "token-thin",
+                ),
+                {
+                    "id": "btc-market",
+                    "question": "Will Bitcoin reach $80,000 in March?",
+                    "slug": "will-bitcoin-reach-80000-in-march",
+                    "description": "This market will immediately resolve to Yes if any Binance 1 minute candle for BTC/USDT during the month specified in the title has a final High price equal to or above the listed price.",
+                    "outcomes": "[\"Yes\", \"No\"]",
+                    "clobTokenIds": "[\"token-btc-yes\", \"token-btc-no\"]",
+                    "volume24hr": 400000,
+                    "volume1wk": 1400000,
+                    "liquidityNum": 350000,
+                    "active": True,
+                    "closed": False,
+                    "events": [{"title": "What price will Bitcoin hit in March?"}],
+                },
+            ],
+            history_by_token={
+                "token-good": _history_points([0.20, 0.23, 0.26]),
+                "token-thin": [{"t": 1735689600, "p": 0.41}],
+                "token-btc-yes": _history_points([0.60, 0.61, 0.65]),
+            },
+            open_interest_by_condition={
+                "condition-good": 300000.0,
+                "condition-thin": 250000.0,
+            },
+        )
+        provider = PolymarketMarketDataProvider(
+            client=client,
+            max_markets=10,
+            page_size=10,
+            max_pages=1,
+            history_days=30,
+            fidelity_minutes=60,
+            target_categories=MonitoringConfig().target_categories,
+            category_aliases=MonitoringConfig().category_aliases,
+        )
+
+        scan = provider.scan_market_series()
+
+        self.assertEqual([series.market.market_id for series in scan.markets], ["good-market"])
+        self.assertEqual(scan.diagnostics.payloads_seen, 5)
+        self.assertEqual(scan.diagnostics.topic_matches, 2)
+        self.assertEqual(scan.diagnostics.selected_markets, 1)
+        self.assertEqual(scan.diagnostics.history_requests, 2)
+        self.assertEqual(scan.diagnostics.rejection_counts["off_topic"], 1)
+        self.assertEqual(scan.diagnostics.rejection_counts["sports_market"], 1)
+        self.assertEqual(scan.diagnostics.rejection_counts["insufficient_history"], 1)
+        self.assertEqual(scan.diagnostics.rejection_counts["public_market_proxy"], 1)
+
+
+class HttpPolymarketClientTests(unittest.TestCase):
+    def test_client_chunks_long_history_requests(self) -> None:
+        client = RecordingHttpPolymarketClient(max_price_history_span_days=14)
+
+        history = client.get_price_history(
+            token_id="token-1",
+            start_ts=0,
+            end_ts=30 * 24 * 60 * 60,
+            fidelity_minutes=60,
+        )
+
+        self.assertEqual(len(client.chunk_calls), 3)
+        self.assertEqual(client.chunk_calls[0]["startTs"], "0")
+        self.assertEqual(client.chunk_calls[-1]["endTs"], str(30 * 24 * 60 * 60))
+        self.assertEqual(
+            [item["t"] for item in history],
+            [0, 1209600, 1209601, 2419201, 2419202, 2592000],
+        )
+
+    def test_client_splits_again_when_endpoint_rejects_chunk_span(self) -> None:
+        client = IntervalLimitedHttpPolymarketClient(max_allowed_span_days=7, max_price_history_span_days=14)
+
+        history = client.get_price_history(
+            token_id="token-1",
+            start_ts=0,
+            end_ts=14 * 24 * 60 * 60,
+            fidelity_minutes=60,
+        )
+
+        self.assertGreater(len(client.chunk_calls), 2)
+        self.assertEqual(history[0]["t"], 0)
+        self.assertEqual(history[-1]["t"], 14 * 24 * 60 * 60)
+
 
 class StubPolymarketClient:
     def __init__(
@@ -344,6 +481,65 @@ def _history_points(probabilities: list[float]) -> list[dict[str, Any]]:
 
 def json_string(values: list[str]) -> str:
     return "[%s]" % ", ".join(f'"{value}"' for value in values)
+
+
+class RecordingHttpPolymarketClient(HttpPolymarketClient):
+    def __init__(self, *, max_price_history_span_days: int = 14) -> None:
+        super().__init__(max_price_history_span_days=max_price_history_span_days)
+        self.chunk_calls: list[dict[str, str]] = []
+
+    def _get_json(
+        self,
+        *,
+        base_url: str,
+        path: str,
+        params: dict[str, str],
+    ) -> Any:
+        if path != "/prices-history":
+            raise AssertionError(f"Unexpected path: {path}")
+        self.chunk_calls.append(dict(params))
+        return {
+            "history": [
+                {"t": int(params["startTs"]), "p": 0.4},
+                {"t": int(params["endTs"]), "p": 0.6},
+            ]
+        }
+
+
+class IntervalLimitedHttpPolymarketClient(RecordingHttpPolymarketClient):
+    def __init__(
+        self,
+        *,
+        max_allowed_span_days: int,
+        max_price_history_span_days: int = 14,
+    ) -> None:
+        super().__init__(max_price_history_span_days=max_price_history_span_days)
+        self.max_allowed_span_seconds = max_allowed_span_days * 24 * 60 * 60
+
+    def _get_json(
+        self,
+        *,
+        base_url: str,
+        path: str,
+        params: dict[str, str],
+    ) -> Any:
+        self.chunk_calls.append(dict(params))
+        start_ts = int(params["startTs"])
+        end_ts = int(params["endTs"])
+        if end_ts - start_ts > self.max_allowed_span_seconds:
+            raise HTTPError(
+                url="https://clob.polymarket.com/prices-history",
+                code=400,
+                msg="Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(b'{"error":"invalid filters: \'startTs\' and \'endTs\' interval is too long"}'),
+            )
+        return {
+            "history": [
+                {"t": start_ts, "p": 0.4},
+                {"t": end_ts, "p": 0.6},
+            ]
+        }
 
 
 if __name__ == "__main__":

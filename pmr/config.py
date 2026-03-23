@@ -19,7 +19,10 @@ class MonitoringConfig:
     short_history_penalty: float = 0.35
     low_confidence_penalty: float = 0.25
     max_events: int = 8
-    max_markets_per_category: int = 25
+    min_markets_per_category: int = 5
+    max_category_share_of_universe: float | None = 0.6
+    max_markets_per_category: int | None = None
+    max_events_per_story_family: int = 1
     target_categories: tuple[str, ...] = (
         "politics",
         "geopolitics",

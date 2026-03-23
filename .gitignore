@@ -17,5 +17,12 @@ wheels/
 .env
 .env.*
 
+# Local run artifacts
+out/
+data/*.sqlite3
+data/*.sqlite3-*
+data/*.db
+data/*.db-*
+
 # OS/editor noise
 .DS_Store

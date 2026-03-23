@@ -7,7 +7,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
+from pmr.market_filters import classify_universe_market_exclusion
 from pmr.models import Market, MarketSeries, MarketSnapshot
+from pmr.universe_selection import UniverseCandidate, market_priority_sort_key, prioritize_universe_candidates
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,16 +78,18 @@ class SnapshotStore:
     def load_market_series(
         self,
         *,
+        target_categories: Sequence[str],
         history_days: int,
         staleness_hours: int,
         max_markets: int,
-        max_markets_per_category: int,
+        min_markets_per_category: int,
+        max_category_share_of_universe: float | None,
+        max_markets_per_category: int | None,
         now: datetime | None = None,
     ) -> tuple[MarketSeries, ...]:
         now = now or datetime.now(timezone.utc)
         min_snapshot_time = now - timedelta(days=history_days)
         min_last_seen = now - timedelta(hours=staleness_hours)
-        per_category_counts: dict[str, int] = {}
         results: list[MarketSeries] = []
 
         with self._connect() as connection:
@@ -100,9 +104,41 @@ class SnapshotStore:
                 (min_last_seen.isoformat(),),
             ).fetchall()
 
-            for row in market_rows:
+            prioritized_rows = prioritize_universe_candidates(
+                [
+                    UniverseCandidate(
+                        item=row,
+                        category=row["category"],
+                        sort_key=market_priority_sort_key(
+                            volume_7d=float(row["volume_7d_usd"]),
+                            volume_24h=float(row["volume_24h_usd"]),
+                            depth=float(row["open_interest_usd"]),
+                            market_id=row["market_id"],
+                        ),
+                    )
+                    for row in market_rows
+                ],
+                target_categories=tuple(target_categories),
+                max_items=max_markets,
+                min_items_per_category=min_markets_per_category,
+                max_category_share=max_category_share_of_universe,
+            )
+
+            per_category_counts: dict[str, int] = {}
+            for wrapper in prioritized_rows:
+                row = wrapper.item
                 category = row["category"]
-                if per_category_counts.get(category, 0) >= max_markets_per_category:
+                exclusion_reason = classify_universe_market_exclusion(
+                    question=row["question"],
+                    description=row["description"],
+                    slug=row["slug"],
+                    event_title=row["event_title"],
+                )
+                if exclusion_reason is not None:
+                    continue
+                if len(results) >= max_markets:
+                    break
+                if max_markets_per_category is not None and per_category_counts.get(category, 0) >= max_markets_per_category:
                     continue
 
                 snapshot_rows = connection.execute(

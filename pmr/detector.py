@@ -18,6 +18,7 @@ from pmr.models import (
     MarketSnapshot,
     RepricingEvent,
 )
+from pmr.story_groups import build_story_family_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +42,8 @@ def detect_significant_moves(
             continue
         events.append(candidate)
 
-    return sorted(events, key=lambda item: item.composite_score, reverse=True)[: config.max_events]
+    ranked = sorted(events, key=lambda item: item.composite_score, reverse=True)
+    return _dedupe_story_families(ranked, config=config)
 
 
 def evaluate_market_event(
@@ -208,6 +210,27 @@ def evaluate_market_event(
         notes=tuple(notes),
         series=series,
     )
+
+
+def _dedupe_story_families(
+    events: Sequence[RepricingEvent],
+    *,
+    config: MonitoringConfig,
+) -> list[RepricingEvent]:
+    limit_per_family = max(config.max_events_per_story_family, 1)
+    family_counts: dict[str, int] = {}
+    selected: list[RepricingEvent] = []
+
+    for event in events:
+        family_key = build_story_family_key(event.market)
+        if family_counts.get(family_key, 0) >= limit_per_family:
+            continue
+        family_counts[family_key] = family_counts.get(family_key, 0) + 1
+        selected.append(event)
+        if len(selected) >= config.max_events:
+            break
+
+    return selected
 
 
 def _select_detection_window_snapshots(
