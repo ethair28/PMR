@@ -3,12 +3,23 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class MonitoringConfig:
-    lookback_days: int = 7
+    """Runtime knobs for weekly event detection and ranking."""
+
+    detection_window_days: int = 7
+    preferred_baseline_window_days: int = 90
+    snapshot_retention_days: int = 120
+    stored_market_staleness_hours: int = 24
+    min_history_days_for_full_scoring: int = 30
+    min_history_days_for_short_scoring: int = 10
+    feature_interval_minutes: int = 60
+    min_abs_move_24h: float = 0.05
+    min_weekly_range: float = 0.08
     min_volume_7d_usd: float = 50_000.0
     min_open_interest_usd: float = 10_000.0
-    min_abs_move: float = 0.08
-    min_anomaly_ratio: float = 2.5
+    short_history_penalty: float = 0.35
+    low_confidence_penalty: float = 0.25
     max_events: int = 8
+    max_markets_per_category: int = 25
     target_categories: tuple[str, ...] = (
         "politics",
         "geopolitics",
@@ -17,7 +28,22 @@ class MonitoringConfig:
     )
     category_aliases: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: {
-            "politics": ("politics", "political", "elections", "government"),
+            "politics": (
+                "politics",
+                "political",
+                "elections",
+                "election",
+                "government",
+                "president",
+                "senate",
+                "house",
+                "congress",
+                "prime minister",
+                "minister",
+                "cabinet",
+                "referendum",
+                "approval",
+            ),
             "geopolitics": (
                 "geopolitics",
                 "geopolitical",
@@ -25,8 +51,45 @@ class MonitoringConfig:
                 "war",
                 "conflict",
                 "international",
+                "ceasefire",
+                "military",
+                "sanctions",
+                "ukraine",
+                "russia",
+                "china",
+                "taiwan",
+                "israel",
+                "gaza",
+                "iran",
+                "nato",
             ),
-            "economics": ("economics", "economic", "economy"),
-            "macro": ("macro", "macroeconomics", "rates", "inflation", "fed"),
+            "economics": (
+                "economics",
+                "economic",
+                "economy",
+                "gdp",
+                "jobs",
+                "payrolls",
+                "unemployment",
+                "tariffs",
+                "trade",
+                "recession",
+                "growth",
+            ),
+            "macro": (
+                "macro",
+                "macroeconomics",
+                "rates",
+                "rate cut",
+                "interest rate",
+                "inflation",
+                "cpi",
+                "pce",
+                "fed",
+                "fomc",
+                "yield",
+                "treasury",
+                "central bank",
+            ),
         }
     )
