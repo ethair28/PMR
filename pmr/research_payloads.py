@@ -5,7 +5,6 @@ from typing import Any, Sequence
 
 from pmr.config import MonitoringConfig
 from pmr.models import RepricingEvent
-from pmr.story_groups import build_story_family_key, build_story_family_label
 
 
 def build_research_input_payload(
@@ -28,6 +27,7 @@ def build_research_input_payload(
             "min_abs_move_24h": config.min_abs_move_24h,
             "min_weekly_range": config.min_weekly_range,
         },
+        "research_jobs": [serialize_research_job(event) for event in events],
         "anomalies": [serialize_event_for_research(event) for event in events],
     }
 
@@ -50,8 +50,13 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
             "event_title": event.market.event_title,
         },
         "story": {
-            "family_key": build_story_family_key(event.market),
-            "family_label": build_story_family_label(event.market),
+            "family_key": event.story_group_key,
+            "family_label": event.story_group_label,
+            "story_type_hint": event.story_type_hint,
+            "distance_from_extremes": event.distance_from_extremes,
+            "entered_extreme_zone": event.entered_extreme_zone,
+            "related_market_ids": list(event.related_market_ids),
+            "related_market_questions": list(event.related_market_questions),
         },
         "detector": {
             "detection_window_start": event.detection_window_start.isoformat(),
@@ -101,3 +106,78 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
         },
         "notes": list(event.notes),
     }
+
+
+def serialize_research_job(event: RepricingEvent) -> dict[str, Any]:
+    """Serialize one anomaly into a story-oriented research brief."""
+
+    return {
+        "job_id": event.story_group_key,
+        "story": {
+            "family_key": event.story_group_key,
+            "family_label": event.story_group_label,
+            "story_type_hint": event.story_type_hint,
+            "distance_from_extremes": event.distance_from_extremes,
+            "entered_extreme_zone": event.entered_extreme_zone,
+            "editorial_priority_hint": _editorial_priority_hint(event),
+        },
+        "investigation": {
+            "question": _build_investigation_question(event),
+            "why_flagged": _build_why_flagged(event),
+            "focus_points": _build_focus_points(event),
+        },
+        "primary_market": serialize_event_for_research(event),
+        "related_markets": [
+            {"market_id": market_id, "question": question}
+            for market_id, question in zip(event.related_market_ids, event.related_market_questions)
+        ],
+    }
+
+
+def _build_investigation_question(event: RepricingEvent) -> str:
+    return (
+        f"What most plausibly explains the repricing in '{event.market.question}' "
+        f"between {event.detection_window_start.isoformat()} and {event.detection_window_end.isoformat()}?"
+    )
+
+
+def _build_why_flagged(event: RepricingEvent) -> str:
+    direction = "up" if event.close_to_open_move >= 0 else "down"
+    return (
+        f"Flagged as a {event.story_type_hint} candidate because the market moved {direction} by "
+        f"{abs(event.close_to_open_move) * 100:.1f} pts from window open to close, reached a "
+        f"{event.weekly_range * 100:.1f} pt weekly range, and posted a max 24h move of "
+        f"{event.max_abs_move_24h * 100:.1f} pts."
+    )
+
+
+def _build_focus_points(event: RepricingEvent) -> list[str]:
+    points = [
+        "Prioritize evidence near the largest move timestamp and compare clear news against rumor-driven repricing.",
+        "Decide whether the move reflects a genuine surprise, a plausible but uncertain explanation, or mostly speculative chatter.",
+    ]
+    if event.story_type_hint == "live_repricing":
+        points.append(
+            "Look for incremental developments, negotiations, leaks, or commentary that shifted odds without fully resolving the market."
+        )
+    elif event.story_type_hint == "resolved_surprise":
+        points.append(
+            "Confirm the concluding outcome and explain why the market appears to have been caught off guard before resolution."
+        )
+    else:
+        points.append(
+            "Check whether this looks like a late-stage confirmation of an already-likely outcome rather than fresh surprise."
+        )
+    if event.related_market_ids:
+        points.append(
+            "Use the related market variants as supporting context, but avoid duplicating the same story in the final writeup."
+        )
+    return points
+
+
+def _editorial_priority_hint(event: RepricingEvent) -> str:
+    if event.story_type_hint == "live_repricing":
+        return "high"
+    if event.story_type_hint == "resolved_surprise":
+        return "medium"
+    return "low"

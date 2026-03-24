@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from pmr.universe_selection import UniverseCandidate, prioritize_universe_candidates
+from pmr.universe_selection import (
+    UniverseCandidate,
+    prioritize_grouped_universe_candidates,
+    prioritize_universe_candidates,
+)
 
 
 class UniverseSelectionTests(unittest.TestCase):
@@ -49,6 +53,66 @@ class UniverseSelectionTests(unittest.TestCase):
         self.assertEqual(
             [candidate.item for candidate in ordered],
             ["pol-1", "geo-1", "macro-1", "pol-2", "pol-3", "pol-4"],
+        )
+
+    def test_grouped_selection_uses_group_priority_then_caps_children(self) -> None:
+        candidates = (
+            UniverseCandidate(
+                item="slovenia-a",
+                category="politics",
+                sort_key=(-310.0, -35.0, -20.0, "slovenia-a"),
+                group_key="event:slovenia-pm",
+                group_sort_key=(-763.0, -68.0, -50.0, "event:slovenia-pm"),
+            ),
+            UniverseCandidate(
+                item="slovenia-b",
+                category="politics",
+                sort_key=(-286.0, -18.0, -20.0, "slovenia-b"),
+                group_key="event:slovenia-pm",
+                group_sort_key=(-763.0, -68.0, -50.0, "event:slovenia-pm"),
+            ),
+            UniverseCandidate(
+                item="slovenia-c",
+                category="politics",
+                sort_key=(-166.0, -14.0, -20.0, "slovenia-c"),
+                group_key="event:slovenia-pm",
+                group_sort_key=(-763.0, -68.0, -50.0, "event:slovenia-pm"),
+            ),
+            UniverseCandidate(
+                item="other-politics",
+                category="politics",
+                sort_key=(-400.0, -60.0, -20.0, "other-politics"),
+                group_key="event:other-politics",
+                group_sort_key=(-400.0, -60.0, -20.0, "event:other-politics"),
+            ),
+            UniverseCandidate(
+                item="geo-1",
+                category="geopolitics",
+                sort_key=(-340.0, -50.0, -20.0, "geo-1"),
+                group_key="event:geo-1",
+                group_sort_key=(-340.0, -50.0, -20.0, "event:geo-1"),
+            ),
+            UniverseCandidate(
+                item="macro-1",
+                category="macro",
+                sort_key=(-330.0, -45.0, -20.0, "macro-1"),
+                group_key="event:macro-1",
+                group_sort_key=(-330.0, -45.0, -20.0, "event:macro-1"),
+            ),
+        )
+
+        ordered = prioritize_grouped_universe_candidates(
+            candidates,
+            target_categories=("politics", "geopolitics", "economics", "macro"),
+            max_items=4,
+            min_items_per_category=1,
+            max_category_share=0.75,
+            max_items_per_group=2,
+        )
+
+        self.assertEqual(
+            [candidate.item for candidate in ordered[:4]],
+            ["slovenia-a", "slovenia-b", "geo-1", "macro-1"],
         )
 
 

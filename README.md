@@ -21,10 +21,13 @@ What is implemented now:
 - A local SQLite snapshot store with retention pruning for live Polymarket runs.
 - Category and liquidity filters focused on politics, geopolitics, economics, and macro.
 - Soft universe selection with category floors plus global overflow instead of rigid equal caps.
+- Event-aware universe selection, so multi-contract stories compete on aggregated event liquidity rather than per-contract liquidity alone.
 - Explicit exclusion of public-market-proxy contracts such as gold, oil, and Bitcoin price-threshold markets.
+- Explicit exclusion of social-activity tracker markets such as tweet-count or follower-count contracts.
 - Story-family deduping so related contract variants collapse into one final research candidate.
+- Editorial hints on each anomaly, including whether the move looks more like a live repricing, a resolved surprise, or a late-stage resolution.
 - A Markdown report generator.
-- A research-input JSON exporter for downstream agent workflows.
+- A research-input JSON exporter that now emits story-oriented research jobs alongside the raw anomaly rows.
 - A sample-data runner so the pipeline works locally without external credentials.
 - Interfaces for swapping in real Polymarket ingestion and web/X research providers.
 
@@ -60,7 +63,7 @@ To fetch real active Polymarket markets, run the weekly detector, and write the 
 ```bash
 python3 main.py \
   --source polymarket \
-  --polymarket-max-markets 100 \
+  --polymarket-max-markets 125 \
   --polymarket-max-pages 20 \
   --output-markdown out/report.md \
   --output-research-json out/research-inputs.json \
@@ -125,10 +128,15 @@ The Polymarket provider currently favors transparency over sophistication:
 - it scans active markets ordered by recent volume,
 - infers target categories from market text,
 - excludes asset-price and futures-style contracts that mostly mirror public market data,
+- excludes social-activity tracker contracts that are outside the report's value proposition,
+- aggregates sibling contracts at the event level during universe selection,
+- lets each winning event contribute only a small number of child contracts into the scoring universe,
 - fetches the tracked outcome history for binary markets,
 - guarantees small category coverage floors, then fills the rest of the universe by the strongest markets overall,
 - applies a soft category-share brake instead of forcing equal caps,
 - and adapts those into `MarketSeries` objects for the detector.
+
+Topic inference intentionally uses the market's own question/description/slug/event title, but not Polymarket's free-form event-context summary. That context can still be useful as a note for research, but it is too noisy to drive inclusion decisions on its own.
 
 The local dataset is kept bounded by:
 
@@ -139,6 +147,8 @@ The local dataset is kept bounded by:
 
 When you run `--source polymarket`, PMR first fetches the live delta or backfill chunk, writes it into SQLite, prunes old data, and then runs detection on the merged stored dataset. That keeps reports stable while avoiding repeated full-history pulls.
 
+The current default operating point is a `125`-market scoring universe and up to `12` final anomaly candidates per run. Those numbers are intended to keep the queue broad enough to catch more medium-liquidity stories without overwhelming the downstream research layer.
+
 The live Polymarket report now appends a diagnostics section that explains:
 
 - how many pages and payloads were scanned,
@@ -146,6 +156,8 @@ The live Polymarket report now appends a diagnostics section that explains:
 - how many histories were requested,
 - how many markets survived selection into storage,
 - and the main rejection reasons for excluded markets.
+
+One important consequence of the event-aware selector is that multi-outcome stories such as election winners or next-prime-minister markets no longer need one single child contract to rank highly on its own. The event can win a universe slot on aggregated liquidity, then PMR keeps only a small number of sibling contracts from that event in the scoring universe.
 
 If you want the same information as structured JSON, use `--output-scan-json`.
 
@@ -156,6 +168,20 @@ The detector also dedupes related market variants before the final ranked output
 - and other markets that share the same Polymarket event title.
 
 This keeps the research queue closer to one item per story instead of one item per contract.
+
+Each final anomaly now also carries lightweight editorial annotations:
+
+- `story_type_hint`: `live_repricing`, `resolved_surprise`, or `late_stage_resolution`
+- `distance_from_extremes`: how close the closing probability is to 0% or 100%
+- `entered_extreme_zone`: whether the market touched an extreme zone during the detection window
+- `related_market_ids` / `related_market_questions`: loose same-story context for the downstream composer or research agent
+
+The research JSON export uses those hints to produce one research job per final candidate, with:
+
+- a primary market,
+- related market variants for context,
+- a short investigation brief,
+- and the raw detector features that explain why the market was flagged.
 
 ## JSON Input Shape
 
@@ -234,6 +260,12 @@ History handling is explicit:
 - `insufficient_data`: less than 10 days, excluded from the main ranked anomaly list
 
 This keeps the system usable for new Polymarket markets without pretending short histories are as trustworthy as older ones.
+
+On top of the anomaly score, PMR now adds lightweight editorial metadata. These hints are not used to suppress markets yet; they exist to help the downstream research/editor layer prioritize:
+
+- `live_repricing`: material move, but the market still looks unresolved
+- `resolved_surprise`: the market moved into an extreme zone from a meaningfully uncertain starting point
+- `late_stage_resolution`: the market mostly confirmed an outcome that was already leaning strongly one way
 
 ## Architecture
 

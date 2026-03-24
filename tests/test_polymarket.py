@@ -84,6 +84,51 @@ class PolymarketProviderTests(unittest.TestCase):
         self.assertEqual(market_series[0].market.open_interest_usd, 420000.0)
         self.assertEqual(market_series[0].market.category, "macro")
 
+    def test_provider_does_not_use_event_context_for_topic_matching(self) -> None:
+        client = StubPolymarketClient(
+            markets=[
+                {
+                    "id": "social-market",
+                    "question": "Will Elon Musk post 380-399 tweets this week?",
+                    "slug": "elon-musk-tweet-count",
+                    "conditionId": "condition-social",
+                    "description": "This market resolves according to the number of times Elon Musk posts on X this week.",
+                    "outcomes": "[\"Yes\", \"No\"]",
+                    "clobTokenIds": "[\"token-social-yes\", \"token-social-no\"]",
+                    "volume24hr": 250000,
+                    "volume1wk": 900000,
+                    "liquidityNum": 300000,
+                    "active": True,
+                    "closed": False,
+                    "events": [
+                        {
+                            "title": "Elon Musk # tweets this week",
+                            "eventMetadata": {
+                                "context_description": "Recent election surges imply traders expect heavy posting."
+                            },
+                        }
+                    ],
+                }
+            ],
+            history_by_token={"token-social-yes": _history_points([0.30, 0.32, 0.35])},
+            open_interest_by_condition={"condition-social": 250000.0},
+        )
+        provider = PolymarketMarketDataProvider(
+            client=client,
+            max_markets=10,
+            page_size=10,
+            max_pages=1,
+            history_days=30,
+            fidelity_minutes=60,
+            target_categories=MonitoringConfig().target_categories,
+            category_aliases=MonitoringConfig().category_aliases,
+        )
+
+        scan = provider.scan_market_series()
+
+        self.assertEqual(scan.markets, ())
+        self.assertEqual(scan.diagnostics.rejection_counts["social_activity_tracker"], 1)
+
     def test_provider_uses_category_floors_then_global_overflow(self) -> None:
         client = StubPolymarketClient(
             markets=[
@@ -133,6 +178,106 @@ class PolymarketProviderTests(unittest.TestCase):
         )
         self.assertEqual([series.market.category for series in market_series].count("politics"), 2)
 
+    def test_provider_uses_event_aggregated_liquidity_and_caps_sibling_contracts(self) -> None:
+        client = StubPolymarketClient(
+            markets=[
+                _market_payload(
+                    "slovenia-golob",
+                    "Will Robert Golob be the next Prime Minister of Slovenia?",
+                    "Politics question",
+                    "condition-slo-1",
+                    "token-slo-1",
+                    event_title="Next Prime Minister of Slovenia",
+                    volume_24h=35_000,
+                    volume_1wk=310_000,
+                ),
+                _market_payload(
+                    "slovenia-jansa",
+                    "Will Janez Janša be the next Prime Minister of Slovenia?",
+                    "Politics question",
+                    "condition-slo-2",
+                    "token-slo-2",
+                    event_title="Next Prime Minister of Slovenia",
+                    volume_24h=18_000,
+                    volume_1wk=286_000,
+                ),
+                _market_payload(
+                    "slovenia-logar",
+                    "Will Anže Logar be the next Prime Minister of Slovenia?",
+                    "Politics question",
+                    "condition-slo-3",
+                    "token-slo-3",
+                    event_title="Next Prime Minister of Slovenia",
+                    volume_24h=14_000,
+                    volume_1wk=166_000,
+                ),
+                _market_payload(
+                    "other-politics",
+                    "Will Candidate A win the election?",
+                    "Politics question",
+                    "condition-pol-1",
+                    "token-pol-1",
+                    event_title="Candidate A election",
+                    volume_24h=60_000,
+                    volume_1wk=400_000,
+                ),
+                _market_payload(
+                    "geo-market",
+                    "US x Iran ceasefire by June?",
+                    "Geopolitics question",
+                    "condition-geo-1",
+                    "token-geo-1",
+                    volume_24h=50_000,
+                    volume_1wk=340_000,
+                ),
+                _market_payload(
+                    "macro-market",
+                    "Will the Fed cut rates this quarter?",
+                    "Macro question",
+                    "condition-macro-1",
+                    "token-macro-1",
+                    volume_24h=45_000,
+                    volume_1wk=330_000,
+                ),
+            ],
+            history_by_token={
+                "token-slo-1": _history_points([0.20, 0.35, 0.58]),
+                "token-slo-2": _history_points([0.70, 0.48, 0.19]),
+                "token-slo-3": _history_points([0.05, 0.03, 0.01]),
+                "token-pol-1": _history_points([0.40, 0.42, 0.44]),
+                "token-geo-1": _history_points([0.30, 0.32, 0.35]),
+                "token-macro-1": _history_points([0.25, 0.27, 0.29]),
+            },
+            open_interest_by_condition={
+                "condition-slo-1": 200000.0,
+                "condition-slo-2": 200000.0,
+                "condition-slo-3": 200000.0,
+                "condition-pol-1": 200000.0,
+                "condition-geo-1": 200000.0,
+                "condition-macro-1": 200000.0,
+            },
+        )
+        provider = PolymarketMarketDataProvider(
+            client=client,
+            max_markets=4,
+            page_size=10,
+            max_pages=1,
+            history_days=30,
+            fidelity_minutes=60,
+            target_categories=MonitoringConfig().target_categories,
+            category_aliases=MonitoringConfig().category_aliases,
+            min_markets_per_category=1,
+            max_category_share_of_universe=0.75,
+            max_contracts_per_event=2,
+        )
+
+        market_series = provider.list_market_series()
+
+        self.assertEqual(
+            {series.market.market_id for series in market_series},
+            {"slovenia-golob", "slovenia-jansa", "geo-market", "macro-market"},
+        )
+
     def test_research_payload_contains_detector_fields(self) -> None:
         client = StubPolymarketClient(
             markets=[
@@ -180,12 +325,20 @@ class PolymarketProviderTests(unittest.TestCase):
         payload = build_research_input_payload(events, MonitoringConfig(), source_name="polymarket")
 
         self.assertEqual(len(payload["anomalies"]), 1)
+        self.assertEqual(len(payload["research_jobs"]), 1)
         anomaly = payload["anomalies"][0]
+        research_job = payload["research_jobs"][0]
         self.assertEqual(anomaly["market"]["tracked_outcome"], "Yes")
         self.assertIn("story", anomaly)
         self.assertIn("features", anomaly)
         self.assertIn("baseline_stats", anomaly)
         self.assertIn("normalized_scores", anomaly)
+        self.assertIn("story_type_hint", anomaly["story"])
+        self.assertIn("distance_from_extremes", anomaly["story"])
+        self.assertIn("entered_extreme_zone", anomaly["story"])
+        self.assertIn("investigation", research_job)
+        self.assertIn("primary_market", research_job)
+        self.assertIn("editorial_priority_hint", research_job["story"])
 
     def test_incremental_refresh_uses_recent_tail_instead_of_full_window(self) -> None:
         current_time = datetime(2026, 3, 23, tzinfo=timezone.utc)
@@ -342,11 +495,33 @@ class PolymarketProviderTests(unittest.TestCase):
                     "closed": False,
                     "events": [{"title": "What price will Bitcoin hit in March?"}],
                 },
+                {
+                    "id": "social-market",
+                    "question": "Will Elon Musk post 380-399 tweets this week?",
+                    "slug": "elon-musk-tweet-count",
+                    "description": "This market resolves according to the number of times Elon Musk posts on X this week. The resolution source is the Post Counter at xtracker.polymarket.com.",
+                    "outcomes": "[\"Yes\", \"No\"]",
+                    "clobTokenIds": "[\"token-social-yes\", \"token-social-no\"]",
+                    "volume24hr": 300000,
+                    "volume1wk": 1100000,
+                    "liquidityNum": 320000,
+                    "active": True,
+                    "closed": False,
+                    "events": [
+                        {
+                            "title": "Elon Musk # tweets this week",
+                            "eventMetadata": {
+                                "context_description": "Recent election surges imply traders expect heavy posting."
+                            },
+                        }
+                    ],
+                },
             ],
             history_by_token={
                 "token-good": _history_points([0.20, 0.23, 0.26]),
                 "token-thin": [{"t": 1735689600, "p": 0.41}],
                 "token-btc-yes": _history_points([0.60, 0.61, 0.65]),
+                "token-social-yes": _history_points([0.30, 0.32, 0.35]),
             },
             open_interest_by_condition={
                 "condition-good": 300000.0,
@@ -367,7 +542,7 @@ class PolymarketProviderTests(unittest.TestCase):
         scan = provider.scan_market_series()
 
         self.assertEqual([series.market.market_id for series in scan.markets], ["good-market"])
-        self.assertEqual(scan.diagnostics.payloads_seen, 5)
+        self.assertEqual(scan.diagnostics.payloads_seen, 6)
         self.assertEqual(scan.diagnostics.topic_matches, 2)
         self.assertEqual(scan.diagnostics.selected_markets, 1)
         self.assertEqual(scan.diagnostics.history_requests, 2)
@@ -375,6 +550,7 @@ class PolymarketProviderTests(unittest.TestCase):
         self.assertEqual(scan.diagnostics.rejection_counts["sports_market"], 1)
         self.assertEqual(scan.diagnostics.rejection_counts["insufficient_history"], 1)
         self.assertEqual(scan.diagnostics.rejection_counts["public_market_proxy"], 1)
+        self.assertEqual(scan.diagnostics.rejection_counts["social_activity_tracker"], 1)
 
 
 class HttpPolymarketClientTests(unittest.TestCase):
@@ -456,6 +632,9 @@ def _market_payload(
     tracked_token_id: str,
     *,
     event_title: str | None = None,
+    volume_24h: float = 150000,
+    volume_1wk: float = 800000,
+    liquidity: float = 250000,
 ) -> dict[str, Any]:
     return {
         "id": market_id,
@@ -465,9 +644,9 @@ def _market_payload(
         "description": description,
         "outcomes": "[\"Yes\", \"No\"]",
         "clobTokenIds": json_string([tracked_token_id, f"{tracked_token_id}-no"]),
-        "volume24hr": 150000,
-        "volume1wk": 800000,
-        "liquidityNum": 250000,
+        "volume24hr": volume_24h,
+        "volume1wk": volume_1wk,
+        "liquidityNum": liquidity,
         "active": True,
         "closed": False,
         "events": [{"title": event_title or question}],

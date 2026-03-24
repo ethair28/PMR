@@ -7,6 +7,7 @@ from typing import Literal
 ExplanationType = Literal["clear", "plausible", "speculative"]
 HistoryMode = Literal["full_history", "short_history", "insufficient_data"]
 ConfidenceLevel = Literal["high", "medium", "low"]
+StoryTypeHint = Literal["live_repricing", "resolved_surprise", "late_stage_resolution"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +98,13 @@ class RepricingEvent:
     persistence_of_largest_move: float
     jump_count_over_threshold: int
     max_move_timestamp: datetime | None
+    story_group_key: str
+    story_group_label: str
+    story_type_hint: StoryTypeHint
+    distance_from_extremes: float
+    entered_extreme_zone: bool
+    related_market_ids: tuple[str, ...]
+    related_market_questions: tuple[str, ...]
     baseline_stats: BaselineStats
     liquidity_metrics: LiquidityMetrics
     z_6h: float

@@ -9,7 +9,12 @@ from typing import Sequence
 
 from pmr.market_filters import classify_universe_market_exclusion
 from pmr.models import Market, MarketSeries, MarketSnapshot
-from pmr.universe_selection import UniverseCandidate, market_priority_sort_key, prioritize_universe_candidates
+from pmr.universe_selection import (
+    UniverseCandidate,
+    build_universe_group_key,
+    market_priority_sort_key,
+    prioritize_grouped_universe_candidates,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,12 +90,14 @@ class SnapshotStore:
         min_markets_per_category: int,
         max_category_share_of_universe: float | None,
         max_markets_per_category: int | None,
+        max_contracts_per_event: int,
         now: datetime | None = None,
     ) -> tuple[MarketSeries, ...]:
         now = now or datetime.now(timezone.utc)
         min_snapshot_time = now - timedelta(days=history_days)
         min_last_seen = now - timedelta(hours=staleness_hours)
         results: list[MarketSeries] = []
+        per_event_counts: dict[str, int] = {}
 
         with self._connect() as connection:
             self._initialize_schema(connection)
@@ -104,7 +111,8 @@ class SnapshotStore:
                 (min_last_seen.isoformat(),),
             ).fetchall()
 
-            prioritized_rows = prioritize_universe_candidates(
+            group_metrics = _aggregate_market_row_group_metrics(market_rows)
+            prioritized_rows = prioritize_grouped_universe_candidates(
                 [
                     UniverseCandidate(
                         item=row,
@@ -115,6 +123,13 @@ class SnapshotStore:
                             depth=float(row["open_interest_usd"]),
                             market_id=row["market_id"],
                         ),
+                        group_key=_row_event_group_key(row),
+                        group_sort_key=market_priority_sort_key(
+                            volume_7d=group_metrics[_row_event_group_key(row)]["volume_7d"],
+                            volume_24h=group_metrics[_row_event_group_key(row)]["volume_24h"],
+                            depth=group_metrics[_row_event_group_key(row)]["depth"],
+                            market_id=_row_event_group_key(row),
+                        ),
                     )
                     for row in market_rows
                 ],
@@ -122,6 +137,7 @@ class SnapshotStore:
                 max_items=max_markets,
                 min_items_per_category=min_markets_per_category,
                 max_category_share=max_category_share_of_universe,
+                max_items_per_group=max_contracts_per_event,
             )
 
             per_category_counts: dict[str, int] = {}
@@ -140,6 +156,9 @@ class SnapshotStore:
                     break
                 if max_markets_per_category is not None and per_category_counts.get(category, 0) >= max_markets_per_category:
                     continue
+                event_group_key = _row_event_group_key(row)
+                if per_event_counts.get(event_group_key, 0) >= max_contracts_per_event:
+                    continue
 
                 snapshot_rows = connection.execute(
                     """
@@ -156,6 +175,7 @@ class SnapshotStore:
 
                 results.append(_row_to_market_series(row, snapshot_rows))
                 per_category_counts[category] = per_category_counts.get(category, 0) + 1
+                per_event_counts[event_group_key] = per_event_counts.get(event_group_key, 0) + 1
                 if len(results) >= max_markets:
                     break
 
@@ -374,3 +394,27 @@ def _row_to_market_series(
         research_hints=tuple(json.loads(market_row["research_hints_json"])),
         notes=market_row["notes"],
     )
+
+
+def _row_event_group_key(market_row: sqlite3.Row) -> str:
+    return build_universe_group_key(
+        event_title=market_row["event_title"],
+        slug=market_row["slug"],
+        question=market_row["question"],
+        market_id=market_row["market_id"],
+    )
+
+
+def _aggregate_market_row_group_metrics(
+    market_rows: Sequence[sqlite3.Row],
+) -> dict[str, dict[str, float]]:
+    metrics: dict[str, dict[str, float]] = {}
+    for row in market_rows:
+        group = metrics.setdefault(
+            _row_event_group_key(row),
+            {"volume_7d": 0.0, "volume_24h": 0.0, "depth": 0.0},
+        )
+        group["volume_7d"] += float(row["volume_7d_usd"])
+        group["volume_24h"] += float(row["volume_24h_usd"])
+        group["depth"] += float(row["open_interest_usd"])
+    return metrics

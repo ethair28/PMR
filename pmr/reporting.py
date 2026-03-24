@@ -57,6 +57,7 @@ def build_markdown_report(
             f"{event.market.question} "
             f"(max 24h move {event.max_abs_move_24h * 100:.1f} pts, "
             f"weekly range {event.weekly_range * 100:.1f} pts, "
+            f"{event.story_type_hint}, "
             f"{event.history_mode}, score {event.composite_score:.2f}, "
             f"{item.research.explanation_type}, confidence {item.research.confidence:.0%})"
         )
@@ -72,12 +73,16 @@ def build_markdown_report(
                 "",
                 f"- Category: {event.market.category}",
                 f"- Market ID: `{event.market.market_id}`",
+                f"- Story group: {event.story_group_label} (`{event.story_group_key}`)",
+                f"- Story type hint: {event.story_type_hint}",
                 f"- Detection window: {event.detection_window_start.isoformat()} to {event.detection_window_end.isoformat()}",
                 f"- History mode: {event.history_mode}",
                 f"- Detector confidence: {event.confidence_level} ({event.confidence_score:.0%})",
                 f"- Window open / close: {event.window_open_probability:.1%} / {event.window_close_probability:.1%}",
                 f"- Close-to-open move: {event.close_to_open_move * 100:.1f} percentage points",
                 f"- Weekly high / low / range: {event.window_high_probability:.1%} / {event.window_low_probability:.1%} / {event.weekly_range * 100:.1f} pts",
+                f"- Entered extreme zone: {'yes' if event.entered_extreme_zone else 'no'}",
+                f"- Distance from extremes at close: {event.distance_from_extremes * 100:.1f} pts",
                 f"- Max abs 6h move: {event.max_abs_move_6h * 100:.1f} pts",
                 f"- Max abs 24h move: {event.max_abs_move_24h * 100:.1f} pts",
                 f"- Max move timestamp: {event.max_move_timestamp.isoformat() if event.max_move_timestamp else 'n/a'}",
@@ -102,6 +107,8 @@ def build_markdown_report(
 
         if event.notes:
             lines.extend(["- Detector notes:"] + [f"  - {point}" for point in event.notes])
+        if event.related_market_questions:
+            lines.extend(["- Related markets:"] + [f"  - {question}" for question in event.related_market_questions])
         if research.evidence:
             lines.extend(["- Evidence candidates:"] + [f"  - {point}" for point in research.evidence])
         if research.caveats:

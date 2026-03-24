@@ -20,8 +20,9 @@ from pmr.polymarket import PolymarketClient
 from pmr.storage import SnapshotBounds, SnapshotStore
 from pmr.universe_selection import (
     UniverseCandidate,
+    build_universe_group_key,
     market_priority_sort_key,
-    prioritize_universe_candidates,
+    prioritize_grouped_universe_candidates,
 )
 
 
@@ -102,6 +103,7 @@ class _TopicalPayloadCandidate:
     payload: dict[str, Any]
     category: str
     matched_terms: tuple[str, ...]
+    event_group_key: str
     sort_key: tuple[float, float, float, str]
 
 
@@ -120,6 +122,7 @@ class PolymarketMarketDataProvider:
     min_markets_per_category: int = 5
     max_category_share_of_universe: float | None = 0.6
     max_markets_per_category: int | None = None
+    max_contracts_per_event: int = 2
     refresh_mode: str = "full"
     existing_snapshot_bounds: dict[str, SnapshotBounds] | None = None
     incremental_overlap_minutes: int = 180
@@ -134,6 +137,7 @@ class PolymarketMarketDataProvider:
         markets: list[MarketSeries] = []
         seen_market_ids: set[str] = set()
         per_category_counts: dict[str, int] = {}
+        per_event_counts: dict[str, int] = {}
         rejection_counts: Counter[str] = Counter()
         sampled_rejections: list[PolymarketRejectedMarket] = []
         topical_candidates: list[_TopicalPayloadCandidate] = []
@@ -239,6 +243,7 @@ class PolymarketMarketDataProvider:
                         payload=payload,
                         category=category,
                         matched_terms=matched_terms,
+                        event_group_key=_payload_event_group_key(payload),
                         sort_key=_payload_sort_key(payload),
                     )
                 )
@@ -246,12 +251,20 @@ class PolymarketMarketDataProvider:
             if len(page) < self.page_size:
                 break
 
-        prioritized_candidates = prioritize_universe_candidates(
+        group_metrics = _aggregate_topical_group_metrics(topical_candidates)
+        prioritized_candidates = prioritize_grouped_universe_candidates(
             [
                 UniverseCandidate(
                     item=candidate,
                     category=candidate.category,
-                    sort_key=candidate.sort_key,
+                    sort_key=_payload_sort_key(candidate.payload),
+                    group_key=candidate.event_group_key,
+                    group_sort_key=market_priority_sort_key(
+                        volume_7d=group_metrics[candidate.event_group_key]["volume_7d"],
+                        volume_24h=group_metrics[candidate.event_group_key]["volume_24h"],
+                        depth=group_metrics[candidate.event_group_key]["depth"],
+                        market_id=candidate.event_group_key,
+                    ),
                 )
                 for candidate in topical_candidates
             ],
@@ -259,6 +272,7 @@ class PolymarketMarketDataProvider:
             max_items=self.max_markets,
             min_items_per_category=self.min_markets_per_category,
             max_category_share=self.max_category_share_of_universe,
+            max_items_per_group=self.max_contracts_per_event,
         )
 
         for candidate_wrapper in prioritized_candidates:
@@ -286,6 +300,15 @@ class PolymarketMarketDataProvider:
                     detail=detail,
                 )
                 continue
+            if per_event_counts.get(candidate.event_group_key, 0) >= self.max_contracts_per_event:
+                record_rejection(
+                    payload=candidate.payload,
+                    reason="event_contract_cap",
+                    category=candidate.category,
+                    matched_terms=candidate.matched_terms,
+                    detail="Candidate was trimmed because too many contracts from the same event were already selected.",
+                )
+                continue
 
             build = self._build_market_series(
                 candidate.payload,
@@ -307,6 +330,7 @@ class PolymarketMarketDataProvider:
                 continue
             markets.append(build.series)
             per_category_counts[candidate.category] = per_category_counts.get(candidate.category, 0) + 1
+            per_event_counts[candidate.event_group_key] = per_event_counts.get(candidate.event_group_key, 0) + 1
 
         return build_result()
 
@@ -415,9 +439,6 @@ class PolymarketMarketDataProvider:
                     _as_optional_str(payload.get("description")),
                     _as_optional_str(payload.get("slug")),
                     _as_optional_str(payload.get("events", [{}])[0].get("title")) if payload.get("events") else None,
-                    _as_optional_str(payload.get("events", [{}])[0].get("eventMetadata", {}).get("context_description"))
-                    if payload.get("events")
-                    else None,
                 ),
             )
         ).lower()
@@ -480,6 +501,7 @@ class StoredMarketDataProvider:
     min_markets_per_category: int
     max_category_share_of_universe: float | None
     max_markets_per_category: int | None = None
+    max_contracts_per_event: int = 2
 
     def list_market_series(self) -> Sequence[MarketSeries]:
         return self.store.load_market_series(
@@ -490,6 +512,7 @@ class StoredMarketDataProvider:
             min_markets_per_category=self.min_markets_per_category,
             max_category_share_of_universe=self.max_category_share_of_universe,
             max_markets_per_category=self.max_markets_per_category,
+            max_contracts_per_event=self.max_contracts_per_event,
         )
 
 
@@ -584,11 +607,48 @@ def _has_binary_clob_shape(payload: dict[str, Any]) -> bool:
 
 def _payload_sort_key(payload: dict[str, Any]) -> tuple[float, float, float, str]:
     return market_priority_sort_key(
-        volume_7d=_to_float(payload.get("volume1wkClob", payload.get("volume1wk")), default=0.0),
-        volume_24h=_to_float(payload.get("volume24hrClob", payload.get("volume24hr")), default=0.0),
-        depth=_to_float(payload.get("liquidityClob", payload.get("liquidityNum")), default=0.0),
+        volume_7d=_payload_volume_7d(payload),
+        volume_24h=_payload_volume_24h(payload),
+        depth=_payload_depth(payload),
         market_id=_as_optional_str(payload.get("id")) or "",
     )
+
+
+def _payload_event_group_key(payload: dict[str, Any]) -> str:
+    first_event = payload.get("events", [{}])[0] if payload.get("events") else {}
+    return build_universe_group_key(
+        event_title=_as_optional_str(first_event.get("title")),
+        slug=_as_optional_str(payload.get("slug")),
+        question=_as_optional_str(payload.get("question")),
+        market_id=_as_optional_str(payload.get("id")) or "",
+    )
+
+
+def _aggregate_topical_group_metrics(
+    candidates: Sequence[_TopicalPayloadCandidate],
+) -> dict[str, dict[str, float]]:
+    metrics: dict[str, dict[str, float]] = {}
+    for candidate in candidates:
+        group = metrics.setdefault(
+            candidate.event_group_key,
+            {"volume_7d": 0.0, "volume_24h": 0.0, "depth": 0.0},
+        )
+        group["volume_7d"] += _payload_volume_7d(candidate.payload)
+        group["volume_24h"] += _payload_volume_24h(candidate.payload)
+        group["depth"] += _payload_depth(candidate.payload)
+    return metrics
+
+
+def _payload_volume_7d(payload: dict[str, Any]) -> float:
+    return _to_float(payload.get("volume1wkClob", payload.get("volume1wk")), default=0.0)
+
+
+def _payload_volume_24h(payload: dict[str, Any]) -> float:
+    return _to_float(payload.get("volume24hrClob", payload.get("volume24hr")), default=0.0)
+
+
+def _payload_depth(payload: dict[str, Any]) -> float:
+    return _to_float(payload.get("liquidityClob", payload.get("liquidityNum")), default=0.0)
 
 
 def _parse_string_list(value: Any) -> tuple[str, ...]:

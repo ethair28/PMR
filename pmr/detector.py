@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import re
 from statistics import median
@@ -17,8 +17,9 @@ from pmr.models import (
     MarketSeries,
     MarketSnapshot,
     RepricingEvent,
+    StoryTypeHint,
 )
-from pmr.story_groups import build_story_family_key
+from pmr.story_groups import build_story_family_key, build_story_family_label
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +44,7 @@ def detect_significant_moves(
         events.append(candidate)
 
     ranked = sorted(events, key=lambda item: item.composite_score, reverse=True)
+    ranked = _attach_related_story_markets(ranked, config=config)
     return _dedupe_story_families(ranked, config=config)
 
 
@@ -94,6 +96,19 @@ def evaluate_market_event(
     persistence = _persistence_of_largest_move(reference_move, window_close_probability)
     jump_count = _count_jump_episodes(moves_24h, config.min_abs_move_24h)
     max_move_timestamp = reference_move.end_snapshot.observed_at if reference_move else None
+    story_group_key = build_story_family_key(series.market)
+    story_group_label = build_story_family_label(series.market)
+    distance_from_extremes = min(window_close_probability, 1.0 - window_close_probability)
+    entered_extreme_zone = _entered_extreme_zone(
+        window_high_probability=window_high_probability,
+        window_low_probability=window_low_probability,
+    )
+    story_type_hint = _classify_story_type_hint(
+        window_open_probability=window_open_probability,
+        window_close_probability=window_close_probability,
+        close_to_open_move=close_to_open_move,
+        entered_extreme_zone=entered_extreme_zone,
+    )
 
     max_abs_move_6h = largest_6h.abs_move if largest_6h else 0.0
     max_abs_move_24h = largest_24h.abs_move if largest_24h else 0.0
@@ -201,6 +216,13 @@ def evaluate_market_event(
         persistence_of_largest_move=persistence,
         jump_count_over_threshold=jump_count,
         max_move_timestamp=max_move_timestamp,
+        story_group_key=story_group_key,
+        story_group_label=story_group_label,
+        story_type_hint=story_type_hint,
+        distance_from_extremes=distance_from_extremes,
+        entered_extreme_zone=entered_extreme_zone,
+        related_market_ids=(),
+        related_market_questions=(),
         baseline_stats=baseline_stats,
         liquidity_metrics=liquidity_metrics,
         z_6h=z_6h,
@@ -210,6 +232,40 @@ def evaluate_market_event(
         notes=tuple(notes),
         series=series,
     )
+
+
+def _attach_related_story_markets(
+    events: Sequence[RepricingEvent],
+    *,
+    config: MonitoringConfig,
+) -> list[RepricingEvent]:
+    max_related = max(config.max_related_markets_per_story, 0)
+    if max_related == 0:
+        return list(events)
+
+    family_members: dict[str, list[RepricingEvent]] = {}
+    for event in events:
+        family_members.setdefault(event.story_group_key, []).append(event)
+
+    enriched: list[RepricingEvent] = []
+    for event in events:
+        siblings = [
+            sibling
+            for sibling in family_members.get(event.story_group_key, ())
+            if sibling.market.market_id != event.market.market_id
+        ]
+        enriched.append(
+            replace(
+                event,
+                related_market_ids=tuple(
+                    sibling.market.market_id for sibling in siblings[:max_related]
+                ),
+                related_market_questions=tuple(
+                    sibling.market.question for sibling in siblings[:max_related]
+                ),
+            )
+        )
+    return enriched
 
 
 def _dedupe_story_families(
@@ -222,15 +278,52 @@ def _dedupe_story_families(
     selected: list[RepricingEvent] = []
 
     for event in events:
-        family_key = build_story_family_key(event.market)
-        if family_counts.get(family_key, 0) >= limit_per_family:
+        if family_counts.get(event.story_group_key, 0) >= limit_per_family:
             continue
-        family_counts[family_key] = family_counts.get(family_key, 0) + 1
+        family_counts[event.story_group_key] = family_counts.get(event.story_group_key, 0) + 1
         selected.append(event)
         if len(selected) >= config.max_events:
             break
 
     return selected
+
+
+def _entered_extreme_zone(
+    *,
+    window_high_probability: float,
+    window_low_probability: float,
+    threshold: float = 0.9,
+) -> bool:
+    return window_high_probability >= threshold or window_low_probability <= (1.0 - threshold)
+
+
+def _classify_story_type_hint(
+    *,
+    window_open_probability: float,
+    window_close_probability: float,
+    close_to_open_move: float,
+    entered_extreme_zone: bool,
+    threshold: float = 0.9,
+) -> StoryTypeHint:
+    if not entered_extreme_zone:
+        return "live_repricing"
+
+    close_extreme = window_close_probability >= threshold or window_close_probability <= (1.0 - threshold)
+    open_extreme = window_open_probability >= threshold or window_open_probability <= (1.0 - threshold)
+    same_direction = (
+        window_close_probability >= 0.5 and window_open_probability >= 0.5
+    ) or (
+        window_close_probability < 0.5 and window_open_probability < 0.5
+    )
+    already_likely = (
+        window_open_probability >= 0.65 or window_open_probability <= 0.35
+    ) and same_direction
+
+    if close_extreme and (open_extreme or already_likely) and abs(close_to_open_move) < 0.35:
+        return "late_stage_resolution"
+    if close_extreme:
+        return "resolved_surprise"
+    return "live_repricing"
 
 
 def _select_detection_window_snapshots(

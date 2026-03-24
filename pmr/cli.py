@@ -82,8 +82,14 @@ def main() -> int:
     parser.add_argument(
         "--polymarket-max-markets",
         type=int,
-        default=100,
+        default=125,
         help="Maximum number of topic-relevant market series to analyze.",
+    )
+    parser.add_argument(
+        "--max-events",
+        type=int,
+        default=12,
+        help="Maximum number of final anomaly candidates to include in the report and research payload.",
     )
     parser.add_argument(
         "--polymarket-page-size",
@@ -113,6 +119,12 @@ def main() -> int:
         "--max-markets-per-category",
         type=int,
         help="Optional legacy hard cap per category. Defaults to disabled.",
+    )
+    parser.add_argument(
+        "--max-contracts-per-event",
+        type=int,
+        default=2,
+        help="Maximum number of sibling contracts from the same Polymarket event to keep in the scoring universe.",
     )
     parser.add_argument(
         "--polymarket-refresh-mode",
@@ -180,6 +192,8 @@ def main() -> int:
         min_markets_per_category=args.min_markets_per_category,
         max_category_share_of_universe=args.max_category_share,
         max_markets_per_category=args.max_markets_per_category,
+        max_contracts_per_event=args.max_contracts_per_event,
+        max_events=args.max_events,
     )
 
     history_days = max(
@@ -211,6 +225,7 @@ def main() -> int:
             min_markets_per_category=config.min_markets_per_category,
             max_category_share_of_universe=config.max_category_share_of_universe,
             max_markets_per_category=config.max_markets_per_category,
+            max_contracts_per_event=config.max_contracts_per_event,
             refresh_mode=args.polymarket_refresh_mode,
             existing_snapshot_bounds=existing_bounds,
             incremental_overlap_minutes=args.incremental_overlap_minutes,
@@ -231,6 +246,7 @@ def main() -> int:
                 min_markets_per_category=config.min_markets_per_category,
                 max_category_share_of_universe=config.max_category_share_of_universe,
                 max_markets_per_category=config.max_markets_per_category,
+                max_contracts_per_event=config.max_contracts_per_event,
             ).list_market_series()
         )
         stored_market_count_after_refresh = len(store.list_market_ids())
@@ -246,6 +262,7 @@ def main() -> int:
                 min_markets_per_category=config.min_markets_per_category,
                 max_category_share_of_universe=config.max_category_share_of_universe,
                 max_markets_per_category=config.max_markets_per_category,
+                max_contracts_per_event=config.max_contracts_per_event,
             ).list_market_series()
         )
     else:

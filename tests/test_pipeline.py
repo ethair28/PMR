@@ -54,6 +54,7 @@ class DetectorTests(unittest.TestCase):
         self.assertLess(abs(event.close_to_open_move), BASE_CONFIG.min_abs_move_24h)
         self.assertGreaterEqual(event.weekly_range, BASE_CONFIG.min_weekly_range)
         self.assertGreaterEqual(event.max_abs_move_24h, BASE_CONFIG.min_abs_move_24h)
+        self.assertEqual(event.story_type_hint, "live_repricing")
 
     def test_two_week_market_is_ranked_in_short_history_mode(self) -> None:
         series = _build_series(
@@ -145,6 +146,42 @@ class DetectorTests(unittest.TestCase):
         events = detect_significant_moves(markets, BASE_CONFIG)
 
         self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].related_market_ids, ("gold-4300",))
+        self.assertEqual(events[0].related_market_questions, ("Question for gold-4300?",))
+
+    def test_market_that_resolves_from_already_likely_side_gets_late_stage_hint(self) -> None:
+        series = _build_series(
+            market_id="late-stage",
+            category="geopolitics",
+            probabilities=(
+                [0.68, 0.69, 0.68, 0.69] * 15
+                + [0.70, 0.74, 0.79, 0.85, 0.89, 0.92, 0.94, 0.95]
+            ),
+        )
+
+        event = evaluate_market_event(series, BASE_CONFIG)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.story_type_hint, "late_stage_resolution")
+        self.assertTrue(event.entered_extreme_zone)
+
+    def test_market_that_resolves_from_ambiguous_base_gets_resolved_surprise_hint(self) -> None:
+        series = _build_series(
+            market_id="resolved-surprise",
+            category="politics",
+            probabilities=(
+                [0.46, 0.47, 0.45, 0.46] * 15
+                + [0.47, 0.50, 0.58, 0.72, 0.84, 0.91, 0.96, 0.98]
+            ),
+        )
+
+        event = evaluate_market_event(series, BASE_CONFIG)
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.story_type_hint, "resolved_surprise")
+        self.assertLess(event.distance_from_extremes, 0.1)
 
 
 class PipelineTests(unittest.TestCase):
@@ -169,6 +206,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(result.event_reports), 1)
         self.assertIn("History mode:", result.markdown_report)
         self.assertIn("Max abs 24h move:", result.markdown_report)
+        self.assertIn("Story type hint:", result.markdown_report)
 
     def test_json_provider_loads_market_file(self) -> None:
         payload = {

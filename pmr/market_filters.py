@@ -51,6 +51,28 @@ PUBLIC_MARKET_PROXY_PATTERNS = (
     r"\bequal to or below\b",
 )
 
+SOCIAL_ACTIVITY_TRACKER_STRONG_PHRASES = (
+    "post counter",
+    "xtracker.polymarket.com",
+    "posts on x",
+    "posts on truth social",
+    "tweet count",
+    "# tweets",
+)
+
+SOCIAL_ACTIVITY_TRACKER_PATTERNS = (
+    r"\btweets? from\b",
+    r"\bhow many tweets\b",
+    r"\bhow many posts\b",
+    r"\bnumber of times\b",
+    r"\bfollowers?\b",
+    r"\blikes?\b",
+    r"\bviews?\b",
+    r"\bsubscribers?\b",
+    r"\breposts?\b",
+    r"\bretweets?\b",
+)
+
 
 def classify_universe_market_exclusion(
     *,
@@ -68,6 +90,13 @@ def classify_universe_market_exclusion(
         event_title=event_title,
     ):
         return "public_market_proxy"
+    if _is_social_activity_tracker_market(
+        question=question,
+        description=description,
+        slug=slug,
+        event_title=event_title,
+    ):
+        return "social_activity_tracker"
     return None
 
 
@@ -96,3 +125,20 @@ def _contains_term(text: str, term: str) -> bool:
     escaped = re.escape(term.lower())
     pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
     return re.search(pattern, text) is not None
+
+
+def _is_social_activity_tracker_market(
+    *,
+    question: str | None,
+    description: str | None,
+    slug: str | None,
+    event_title: str | None,
+) -> bool:
+    text = " ".join(part for part in (question, description, slug, event_title) if part).lower()
+    if not text:
+        return False
+
+    if any(phrase in text for phrase in SOCIAL_ACTIVITY_TRACKER_STRONG_PHRASES):
+        return True
+
+    return any(re.search(pattern, text) is not None for pattern in SOCIAL_ACTIVITY_TRACKER_PATTERNS)
