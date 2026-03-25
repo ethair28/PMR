@@ -6,24 +6,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from pmr.config import MonitoringConfig
-from pmr.pipeline import run_pipeline
+from pmr.pipeline import run_detection_pipeline
 from pmr.polymarket import HttpPolymarketClient
 from pmr.providers import (
     JsonFileMarketDataProvider,
-    MockResearchProvider,
     PolymarketMarketDataProvider,
     PolymarketScanDiagnostics,
     StoredMarketDataProvider,
     StaticMarketDataProvider,
 )
 from pmr.research_payloads import build_research_input_payload
+from pmr.reporting import build_markdown_report
 from pmr.sample_data import build_sample_market_series
 from pmr.storage import SnapshotStore
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Detect significant prediction-market repricing and draft a Markdown report."
+        description="Detect significant prediction-market repricing and export research-job JSON."
     )
     parser.add_argument(
         "--source",
@@ -165,7 +165,12 @@ def main() -> int:
     parser.add_argument(
         "--output-markdown",
         type=Path,
-        help="Optional path to write the Markdown report.",
+        help="Optional path to write a detector markdown report for debugging.",
+    )
+    parser.add_argument(
+        "--print-markdown",
+        action="store_true",
+        help="Print the detector markdown report to stdout. Intended for debugging, not the default workflow.",
     )
     parser.add_argument(
         "--output-research-json",
@@ -268,25 +273,14 @@ def main() -> int:
     else:
         markets = tuple(build_sample_market_series())
 
-    result = run_pipeline(
+    result = run_detection_pipeline(
         market_data_provider=StaticMarketDataProvider(markets),
-        research_provider=MockResearchProvider(),
         config=config,
     )
 
-    markdown_report = result.markdown_report
-    if polymarket_scan_diagnostics is not None:
-        markdown_report = _append_polymarket_scan_summary(
-            markdown_report,
-            diagnostics=polymarket_scan_diagnostics,
-            stored_market_count_after_refresh=stored_market_count_after_refresh,
-        )
-
-    if args.output_markdown:
-        _write_text(args.output_markdown, markdown_report)
     if args.output_research_json:
         research_payload = build_research_input_payload(
-            events=tuple(item.event for item in result.event_reports),
+            events=result.events,
             config=config,
             source_name=source_name,
         )
@@ -302,8 +296,29 @@ def main() -> int:
                 indent=2,
             ),
         )
-
-    print(markdown_report)
+    if args.output_markdown or args.print_markdown:
+        markdown_report = build_markdown_report(events=result.events, config=config)
+        if polymarket_scan_diagnostics is not None:
+            markdown_report = _append_polymarket_scan_summary(
+                markdown_report,
+                diagnostics=polymarket_scan_diagnostics,
+                stored_market_count_after_refresh=stored_market_count_after_refresh,
+            )
+        if args.output_markdown:
+            _write_text(args.output_markdown, markdown_report)
+        if args.print_markdown:
+            print(markdown_report)
+    summary_parts = [
+        f"PMR detection run complete: {len(result.events)} final anomaly candidates."
+    ]
+    if args.output_research_json:
+        summary_parts.append(f"Research jobs written to {args.output_research_json}.")
+    if args.output_markdown:
+        summary_parts.append(f"Debug markdown written to {args.output_markdown}.")
+    if polymarket_scan_diagnostics is not None and args.output_scan_json:
+        summary_parts.append(f"Scan diagnostics written to {args.output_scan_json}.")
+    if not args.print_markdown:
+        print(" ".join(summary_parts))
     return 0
 
 

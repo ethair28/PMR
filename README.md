@@ -8,14 +8,14 @@ The current repository provides a working first pass of that flow:
 
 1. Filter markets by category and liquidity.
 2. Detect weekly repricing events that happened anywhere inside the last 7 days.
-3. Run a research step through a provider interface.
-4. Draft a Markdown report suitable for a newsletter or analyst workflow.
+3. Export typed research jobs for a second-stage research pipeline.
+4. Run an X-first research pass and persist structured research results.
 
 ## Current Scope
 
 What is implemented now:
 
-- A domain model for markets, snapshots, detected repricing events, and research findings.
+- A domain model for markets, snapshots, detected repricing events, research jobs, normalized evidence, and structured research results.
 - A detection engine that scores moves over the last 7 days.
 - A live Polymarket provider that fetches active markets from Gamma, price history from the public CLOB API, and open interest from the public Data API.
 - A local SQLite snapshot store with retention pruning for live Polymarket runs.
@@ -26,17 +26,18 @@ What is implemented now:
 - Explicit exclusion of social-activity tracker markets such as tweet-count or follower-count contracts.
 - Story-family deduping so related contract variants collapse into one final research candidate.
 - Editorial hints on each anomaly, including whether the move looks more like a live repricing, a resolved surprise, or a late-stage resolution.
-- A Markdown report generator.
+- An optional detector-only Markdown report generator for debugging and tuning.
 - A research-input JSON exporter that now emits story-oriented research jobs alongside the raw anomaly rows.
+- A separate research runner that consumes those jobs, caches normalized evidence in bounded SQLite storage, and writes structured research results JSON.
 - A sample-data runner so the pipeline works locally without external credentials.
-- Interfaces for swapping in real Polymarket ingestion and web/X research providers.
+- An xAI-backed research source and synthesizer abstraction for X-first live research plus web corroboration.
 
 What is not implemented yet:
 
 - Real-time or scheduled jobs.
-- Web and X research.
 - Email delivery.
 - Historical calibration and analyst-review tooling.
+- Final multi-story newsletter composition.
 
 ## Run
 
@@ -58,17 +59,21 @@ python3 main.py --source json --input-json data/markets.json
 
 ## Run Against Live Polymarket Data
 
-To fetch real active Polymarket markets, run the weekly detector, and write the anomaly payloads that a research agent can consume:
+To fetch real active Polymarket markets, run the weekly detector, and write the anomaly payloads that the research stage consumes:
 
 ```bash
 python3 main.py \
   --source polymarket \
   --polymarket-max-markets 125 \
   --polymarket-max-pages 20 \
-  --output-markdown out/report.md \
   --output-research-json out/research-inputs.json \
   --output-scan-json out/scan-diagnostics.json
 ```
+
+If you want the human-readable detector report for debugging, add either:
+
+- `--output-markdown out/report.md`
+- `--print-markdown`
 
 If you want a reproducible local snapshot store as you evaluate live runs:
 
@@ -89,7 +94,6 @@ Then you can rerun reports from the stored dataset without hitting the live APIs
 python3 main.py \
   --source stored \
   --db-path data/pmr.sqlite3 \
-  --output-markdown out/stored-report.md \
   --output-research-json out/stored-research-inputs.json
 ```
 
@@ -149,7 +153,7 @@ When you run `--source polymarket`, PMR first fetches the live delta or backfill
 
 The current default operating point is a `125`-market scoring universe and up to `12` final anomaly candidates per run. Those numbers are intended to keep the queue broad enough to catch more medium-liquidity stories without overwhelming the downstream research layer.
 
-The live Polymarket report now appends a diagnostics section that explains:
+When you request the optional detector Markdown report, PMR appends a diagnostics section that explains:
 
 - how many pages and payloads were scanned,
 - how many markets matched the topical filter,
@@ -182,6 +186,39 @@ The research JSON export uses those hints to produce one research job per final 
 - related market variants for context,
 - a short investigation brief,
 - and the raw detector features that explain why the market was flagged.
+
+## Run The Research Layer
+
+The detector stage now stops at `research-inputs.json`. The research stage is a separate CLI that consumes those jobs and writes the canonical structured results:
+
+```bash
+python3 -m pmr.research_cli \
+  --input-json out/research-inputs.json \
+  --db-path data/research.sqlite3 \
+  --output-results-json out/research-results.json
+```
+
+Or with the package script:
+
+```bash
+pmr-research \
+  --input-json out/research-inputs.json \
+  --output-results-json out/research-results.json
+```
+
+The xAI-backed research runner expects:
+
+- `XAI_API_KEY`
+- optional `PMR_XAI_MODEL`
+- optional `XAI_BASE_URL`
+
+The research cache is explicitly bounded:
+
+- only normalized evidence metadata plus short excerpts are stored
+- raw evidence expires after 30 days by default
+- synthesized results expire after 90 days by default
+- only the two most recent cached versions per job/provider are retained
+- oldest cached batches are pruned if the SQLite file exceeds its size cap
 
 ## JSON Input Shape
 
@@ -276,23 +313,26 @@ Core modules:
 - `pmr/models.py`: shared dataclasses for the pipeline.
 - `pmr/detector.py`: weekly event extraction, baseline normalization, and ranking.
 - `pmr/polymarket.py`: public Polymarket HTTP client.
-- `pmr/providers.py`: provider interfaces plus local mock/json implementations.
-- `pmr/research_payloads.py`: JSON serialization for downstream research-agent jobs.
+- `pmr/providers.py`: data-provider interfaces plus JSON, static, and Polymarket implementations.
+- `pmr/research_payloads.py`: JSON serialization for research jobs and research results.
+- `pmr/research_engine.py`: query planning, evidence ranking, caching, and synthesis orchestration.
+- `pmr/research_store.py`: bounded SQLite cache for normalized evidence and structured research results.
+- `pmr/research_xai.py`: xAI-backed X-first research source and synthesizer.
 - `pmr/story_groups.py`: story-family keys used for deduping related markets.
 - `pmr/storage.py`: SQLite snapshot persistence, bounded retention, and stored-data loading.
 - `pmr/universe_selection.py`: soft category-floor and overflow-based universe selection.
-- `pmr/pipeline.py`: orchestration.
-- `pmr/reporting.py`: Markdown report rendering.
+- `pmr/pipeline.py`: detection-stage orchestration.
+- `pmr/reporting.py`: detector-only Markdown report rendering.
 - `pmr/sample_data.py`: deterministic local demo dataset.
 
 ## Planned Next Steps
 
 The highest-value next milestones are:
 
-1. Add a research provider that queries both the web and X, then produces evidence-ranked explanations.
+1. Validate the xAI-backed research runner on real jobs and tune the evidence prompts around X-vs-web balance.
 2. Add a historical evaluation loop so thresholds and exclusion rules can be calibrated against real weeks of Polymarket behavior.
-3. Refine story-family clustering so closely related geopolitical and election markets can be grouped more intelligently before research.
-4. Add scheduling and delivery once the signal quality is stable.
+3. Refine story-family clustering so closely related geopolitical and election markets can be grouped more intelligently before final composition.
+4. Add scheduling, delivery, and final newsletter/editor composition once the research output is stable.
 
 ## Testing
 

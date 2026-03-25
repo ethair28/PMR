@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Sequence
 
 from pmr.config import MonitoringConfig
-from pmr.models import RepricingEvent
+from pmr.models import (
+    EvidenceItem,
+    RelatedMarket,
+    RepricingEvent,
+    ResearchBatchResult,
+    ResearchJob,
+    ResearchMarketContext,
+    ResearchResult,
+)
 
 
 def build_research_input_payload(
@@ -181,3 +191,131 @@ def _editorial_priority_hint(event: RepricingEvent) -> str:
     if event.story_type_hint == "resolved_surprise":
         return "medium"
     return "low"
+
+
+def load_research_jobs_from_file(path: Path) -> tuple[ResearchJob, ...]:
+    """Load typed research jobs from a previously exported JSON payload."""
+
+    payload = json.loads(path.read_text())
+    return load_research_jobs_from_payload(payload)
+
+
+def load_research_jobs_from_payload(payload: dict[str, Any]) -> tuple[ResearchJob, ...]:
+    """Parse typed research jobs from the current JSON handoff contract."""
+
+    return tuple(_parse_research_job(item) for item in payload.get("research_jobs", ()))
+
+
+def build_research_results_payload(batch: ResearchBatchResult) -> dict[str, Any]:
+    """Serialize a batch of research results for storage or downstream tooling."""
+
+    return {
+        "generated_at": batch.generated_at.isoformat(),
+        "provider": batch.provider,
+        "prompt_version": batch.prompt_version,
+        "processed_jobs": batch.processed_jobs,
+        "cached_jobs": batch.cached_jobs,
+        "failed_jobs": batch.failed_jobs,
+        "results": [serialize_research_result(result) for result in batch.results],
+    }
+
+
+def serialize_research_result(result: ResearchResult) -> dict[str, Any]:
+    """Serialize one structured research result."""
+
+    return {
+        "job_id": result.job_id,
+        "cache_key": result.cache_key,
+        "provider": result.provider,
+        "prompt_version": result.prompt_version,
+        "status": result.status,
+        "explanation_class": result.explanation_class,
+        "confidence": result.confidence,
+        "most_plausible_explanation": result.most_plausible_explanation,
+        "why_market_moved": result.why_market_moved,
+        "key_evidence": [serialize_evidence_item(item) for item in result.key_evidence],
+        "contradictory_evidence": [serialize_evidence_item(item) for item in result.contradictory_evidence],
+        "open_questions": list(result.open_questions),
+        "completed_at": result.completed_at.isoformat(),
+        "error_message": result.error_message,
+        "used_cache": result.used_cache,
+    }
+
+
+def serialize_evidence_item(item: EvidenceItem) -> dict[str, Any]:
+    """Serialize a normalized evidence record."""
+
+    return {
+        "source_type": item.source_type,
+        "url": item.url,
+        "title_or_text": item.title_or_text,
+        "author_or_publication": item.author_or_publication,
+        "published_at": item.published_at.isoformat() if item.published_at else None,
+        "collected_at": item.collected_at.isoformat(),
+        "relevance_score": item.relevance_score,
+        "temporal_proximity_score": item.temporal_proximity_score,
+        "stance": item.stance,
+        "excerpt": item.excerpt,
+        "query": item.query,
+    }
+
+
+def _parse_research_job(payload: dict[str, Any]) -> ResearchJob:
+    story = payload["story"]
+    investigation = payload["investigation"]
+    primary_market = _parse_primary_market(payload["primary_market"])
+    related_markets = tuple(
+        RelatedMarket(
+            market_id=str(item["market_id"]),
+            question=str(item["question"]),
+        )
+        for item in payload.get("related_markets", ())
+    )
+    return ResearchJob(
+        job_id=str(payload["job_id"]),
+        family_key=str(story["family_key"]),
+        family_label=str(story["family_label"]),
+        story_type_hint=story["story_type_hint"],
+        distance_from_extremes=float(story["distance_from_extremes"]),
+        entered_extreme_zone=bool(story["entered_extreme_zone"]),
+        editorial_priority_hint=story["editorial_priority_hint"],
+        investigation_question=str(investigation["question"]),
+        why_flagged=str(investigation["why_flagged"]),
+        focus_points=tuple(str(point) for point in investigation.get("focus_points", ())),
+        primary_market=primary_market,
+        related_markets=related_markets,
+    )
+
+
+def _parse_primary_market(payload: dict[str, Any]) -> ResearchMarketContext:
+    market = payload["market"]
+    detector = payload["detector"]
+    features = payload["features"]
+    return ResearchMarketContext(
+        market_id=str(market["market_id"]),
+        question=str(market["question"]),
+        detection_window_start=datetime.fromisoformat(detector["detection_window_start"]),
+        detection_window_end=datetime.fromisoformat(detector["detection_window_end"]),
+        history_mode=detector["history_mode"],
+        confidence_level=detector["confidence_level"],
+        confidence_score=float(detector["confidence_score"]),
+        composite_score=float(detector["composite_score"]),
+        close_to_open_move=float(features["close_to_open_move"]),
+        max_abs_move_24h=float(features["max_abs_move_24h"]),
+        weekly_range=float(features["weekly_range"]),
+        max_move_timestamp=(
+            datetime.fromisoformat(detector["max_move_timestamp"])
+            if detector.get("max_move_timestamp")
+            else None
+        ),
+        category=str(market["category"]),
+        slug=market.get("slug"),
+        url=market.get("url"),
+        description=market.get("description"),
+        tags=tuple(str(tag) for tag in market.get("tags", ())),
+        condition_id=market.get("condition_id"),
+        tracked_outcome=market.get("tracked_outcome"),
+        tracked_token_id=market.get("tracked_token_id"),
+        event_title=market.get("event_title"),
+        notes=tuple(str(note) for note in payload.get("notes", ())),
+    )

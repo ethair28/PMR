@@ -9,8 +9,9 @@ from pathlib import Path
 from pmr.config import MonitoringConfig
 from pmr.detector import detect_significant_moves, evaluate_market_event
 from pmr.models import Market, MarketSeries, MarketSnapshot
-from pmr.pipeline import run_pipeline
-from pmr.providers import JsonFileMarketDataProvider, MockResearchProvider, StaticMarketDataProvider
+from pmr.pipeline import run_detection_pipeline
+from pmr.providers import JsonFileMarketDataProvider, StaticMarketDataProvider
+from pmr.reporting import build_markdown_report
 
 
 BASE_CONFIG = MonitoringConfig()
@@ -185,7 +186,7 @@ class DetectorTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
-    def test_pipeline_report_includes_new_detector_fields(self) -> None:
+    def test_pipeline_report_is_detector_only(self) -> None:
         markets = (
             _build_series(
                 market_id="pipeline-market",
@@ -197,16 +198,18 @@ class PipelineTests(unittest.TestCase):
             ),
         )
 
-        result = run_pipeline(
+        result = run_detection_pipeline(
             market_data_provider=StaticMarketDataProvider(markets),
-            research_provider=MockResearchProvider(),
             config=BASE_CONFIG,
         )
 
-        self.assertEqual(len(result.event_reports), 1)
-        self.assertIn("History mode:", result.markdown_report)
-        self.assertIn("Max abs 24h move:", result.markdown_report)
-        self.assertIn("Story type hint:", result.markdown_report)
+        self.assertEqual(len(result.events), 1)
+        markdown_report = build_markdown_report(result.events, BASE_CONFIG)
+        self.assertIn("History mode:", markdown_report)
+        self.assertIn("Max abs 24h move:", markdown_report)
+        self.assertIn("Story type hint:", markdown_report)
+        self.assertNotIn("Research view:", markdown_report)
+        self.assertNotIn("Summary:", markdown_report)
 
     def test_json_provider_loads_market_file(self) -> None:
         payload = {

@@ -8,6 +8,10 @@ ExplanationType = Literal["clear", "plausible", "speculative"]
 HistoryMode = Literal["full_history", "short_history", "insufficient_data"]
 ConfidenceLevel = Literal["high", "medium", "low"]
 StoryTypeHint = Literal["live_repricing", "resolved_surprise", "late_stage_resolution"]
+EditorialPriority = Literal["high", "medium", "low"]
+EvidenceSourceType = Literal["x_post", "web_article", "news_article"]
+EvidenceStance = Literal["supporting", "contradictory", "contextual"]
+ResearchStatus = Literal["completed", "insufficient_evidence", "failed"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,11 +132,127 @@ class RepricingEvent:
 
 
 @dataclass(frozen=True, slots=True)
-class ResearchFinding:
-    """Research-layer explanation attached to a detected anomaly."""
+class RelatedMarket:
+    """A secondary market that provides context for a research job."""
 
-    explanation_type: ExplanationType
-    summary: str
+    market_id: str
+    question: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchMarketContext:
+    """Typed primary-market context for a research job."""
+
+    market_id: str
+    question: str
+    detection_window_start: datetime
+    detection_window_end: datetime
+    history_mode: HistoryMode
+    confidence_level: ConfidenceLevel
+    confidence_score: float
+    composite_score: float
+    close_to_open_move: float
+    max_abs_move_24h: float
+    weekly_range: float
+    max_move_timestamp: datetime | None
+    category: str
+    slug: str | None = None
+    url: str | None = None
+    description: str | None = None
+    tags: tuple[str, ...] = ()
+    condition_id: str | None = None
+    tracked_outcome: str | None = None
+    tracked_token_id: str | None = None
+    event_title: str | None = None
+    notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchJob:
+    """A typed research brief derived from one detected anomaly candidate."""
+
+    job_id: str
+    family_key: str
+    family_label: str
+    story_type_hint: StoryTypeHint
+    distance_from_extremes: float
+    entered_extreme_zone: bool
+    editorial_priority_hint: EditorialPriority
+    investigation_question: str
+    why_flagged: str
+    focus_points: tuple[str, ...]
+    primary_market: ResearchMarketContext
+    related_markets: tuple[RelatedMarket, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchQueryPlan:
+    """Search-plan inputs for one research job."""
+
+    job_id: str
+    x_queries: tuple[str, ...]
+    web_queries: tuple[str, ...]
+    time_window_start: datetime
+    time_window_end: datetime
+    focus_timestamp: datetime | None
+    focus_points: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceItem:
+    """Normalized evidence collected during the research step."""
+
+    source_type: EvidenceSourceType
+    url: str
+    title_or_text: str
+    author_or_publication: str | None
+    published_at: datetime | None
+    collected_at: datetime
+    relevance_score: float
+    temporal_proximity_score: float
+    stance: EvidenceStance
+    excerpt: str
+    query: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchResult:
+    """Structured explanation produced by the research layer."""
+
+    job_id: str
+    cache_key: str
+    provider: str
+    prompt_version: str
+    status: ResearchStatus
+    explanation_class: ExplanationType | None
     confidence: float
-    evidence: tuple[str, ...]
-    caveats: tuple[str, ...] = ()
+    most_plausible_explanation: str
+    why_market_moved: str
+    key_evidence: tuple[EvidenceItem, ...]
+    contradictory_evidence: tuple[EvidenceItem, ...]
+    open_questions: tuple[str, ...]
+    completed_at: datetime
+    error_message: str | None = None
+    used_cache: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchBatchResult:
+    """Batch output for a run of the research layer."""
+
+    provider: str
+    prompt_version: str
+    generated_at: datetime
+    results: tuple[ResearchResult, ...]
+
+    @property
+    def processed_jobs(self) -> int:
+        return len(self.results)
+
+    @property
+    def cached_jobs(self) -> int:
+        return sum(1 for result in self.results if result.used_cache)
+
+    @property
+    def failed_jobs(self) -> int:
+        return sum(1 for result in self.results if result.status == "failed")

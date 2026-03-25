@@ -1,21 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Sequence
 
 from pmr.config import MonitoringConfig
-from pmr.models import RepricingEvent, ResearchFinding
-
-
-@dataclass(frozen=True, slots=True)
-class EventReport:
-    event: RepricingEvent
-    research: ResearchFinding
+from pmr.models import RepricingEvent
 
 
 def build_markdown_report(
-    event_reports: Sequence[EventReport],
+    events: Sequence[RepricingEvent],
     config: MonitoringConfig,
     generated_at: datetime | None = None,
 ) -> str:
@@ -39,7 +32,7 @@ def build_markdown_report(
         "",
     ]
 
-    if not event_reports:
+    if not events:
         lines.extend(
             [
                 "## Result",
@@ -50,8 +43,7 @@ def build_markdown_report(
         return "\n".join(lines)
 
     lines.extend(["## Headline Moves", ""])
-    for item in event_reports:
-        event = item.event
+    for event in events:
         lines.append(
             "- "
             f"{event.market.question} "
@@ -59,14 +51,11 @@ def build_markdown_report(
             f"weekly range {event.weekly_range * 100:.1f} pts, "
             f"{event.story_type_hint}, "
             f"{event.history_mode}, score {event.composite_score:.2f}, "
-            f"{item.research.explanation_type}, confidence {item.research.confidence:.0%})"
+            f"detector confidence {event.confidence_score:.0%})"
         )
 
     lines.extend(["", "## Detailed Analysis", ""])
-    for index, item in enumerate(event_reports, start=1):
-        event = item.event
-        research = item.research
-
+    for index, event in enumerate(events, start=1):
         lines.extend(
             [
                 f"### {index}. {event.market.question}",
@@ -100,8 +89,6 @@ def build_markdown_report(
                 f"${event.liquidity_metrics.open_interest_usd:,.0f}",
                 f"- Liquidity score: {event.liquidity_metrics.liquidity_score:.2f}",
                 f"- Composite score: {event.composite_score:.2f}",
-                f"- Research view: {research.explanation_type} ({research.confidence:.0%} confidence)",
-                f"- Summary: {research.summary}",
             ]
         )
 
@@ -109,10 +96,6 @@ def build_markdown_report(
             lines.extend(["- Detector notes:"] + [f"  - {point}" for point in event.notes])
         if event.related_market_questions:
             lines.extend(["- Related markets:"] + [f"  - {question}" for question in event.related_market_questions])
-        if research.evidence:
-            lines.extend(["- Evidence candidates:"] + [f"  - {point}" for point in research.evidence])
-        if research.caveats:
-            lines.extend(["- Caveats:"] + [f"  - {point}" for point in research.caveats])
         lines.append("")
 
     return "\n".join(lines)

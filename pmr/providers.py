@@ -13,7 +13,6 @@ from pmr.models import (
     MarketSeries,
     MarketSnapshot,
     RepricingEvent,
-    ResearchFinding,
 )
 from pmr.market_filters import classify_universe_market_exclusion
 from pmr.polymarket import PolymarketClient
@@ -29,11 +28,6 @@ from pmr.universe_selection import (
 class MarketDataProvider(Protocol):
     def list_market_series(self) -> Sequence[MarketSeries]:
         """Return market histories for downstream filtering and analysis."""
-
-
-class ResearchProvider(Protocol):
-    def investigate(self, event: RepricingEvent) -> ResearchFinding:
-        """Investigate a repricing event and return a synthesized finding."""
 
 
 @dataclass(slots=True)
@@ -514,58 +508,6 @@ class StoredMarketDataProvider:
             max_markets_per_category=self.max_markets_per_category,
             max_contracts_per_event=self.max_contracts_per_event,
         )
-
-
-@dataclass(slots=True)
-class MockResearchProvider:
-    """Placeholder provider until web/X-backed research is wired in."""
-
-    def investigate(self, event: RepricingEvent) -> ResearchFinding:
-        hints = event.series.research_hints
-        signal_cap = 0.45 + 0.5 * event.confidence_score
-        if len(hints) >= 2:
-            explanation_type = "clear"
-            confidence = min(signal_cap, min(0.9, 0.62 + 0.08 * len(hints)))
-            summary = (
-                "Multiple independent clues line up with the repricing, "
-                "so the move likely reflects a real information update."
-            )
-        elif len(hints) == 1:
-            explanation_type = "plausible"
-            confidence = min(signal_cap, 0.58)
-            summary = (
-                "There is one concrete lead, but the evidence is still too thin "
-                "to call the explanation definitive."
-            )
-        else:
-            explanation_type = "speculative"
-            confidence = min(signal_cap, 0.32)
-            summary = (
-                "No research backend is configured yet, so the cause remains "
-                "a hypothesis rather than an evidenced explanation."
-            )
-
-        evidence = hints or (
-            "Run a web and X research pass for this market before treating the move as explained.",
-        )
-        caveats = ()
-        if event.history_mode != "full_history":
-            caveats += ("The detector is operating without a deep baseline, so signal confidence is lower.",)
-        if event.persistence_of_largest_move < 0.35 and event.weekly_range >= event.max_abs_move_24h:
-            caveats += ("A large part of the move retraced before the close, which makes causal attribution noisier.",)
-        if event.jump_count_over_threshold > 1:
-            caveats += ("There were multiple large jump episodes during the week, not just a single clean repricing.",)
-        if event.market.volume_24h_usd < event.market.volume_7d_usd / 10:
-            caveats += ("Trading activity cooled after the move, which can make the signal less reliable.",)
-
-        return ResearchFinding(
-            explanation_type=explanation_type,
-            summary=summary,
-            confidence=confidence,
-            evidence=evidence,
-            caveats=caveats,
-        )
-
 
 def _market_series_from_dict(payload: dict) -> MarketSeries:
     market = Market(

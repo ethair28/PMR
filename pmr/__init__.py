@@ -1,5 +1,5 @@
 """Prediction-market repricing monitor."""
 
-from pmr.pipeline import PipelineResult
+from pmr.pipeline import DetectionPipelineResult
 
-__all__ = ["PipelineResult"]
+__all__ = ["DetectionPipelineResult"]
