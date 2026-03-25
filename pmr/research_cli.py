@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from pmr.research_engine import ResearchEngine
@@ -13,8 +14,8 @@ from pmr.research_store import ResearchCacheConfig, ResearchStore
 from pmr.research_xai import XaiResearchSource, XaiResearchSynthesizer
 
 
-PROMPT_VERSION = "pmr_research_v1"
-PROVIDER_NAME = "xai_x_first"
+PROMPT_VERSION = "pmr_research_v2_xai_sdk"
+PROVIDER_NAME = "xai_sdk_x_first"
 
 
 def main() -> int:
@@ -91,6 +92,7 @@ def main() -> int:
         help="Maximum allowed SQLite cache size before oldest batches are pruned.",
     )
     args = parser.parse_args()
+    _load_dotenv_if_present(Path(".env"))
 
     jobs = load_research_jobs_from_file(args.input_json)
     if args.job_ids:
@@ -130,6 +132,36 @@ def main() -> int:
 def _write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
+
+
+def _load_dotenv_if_present(path: Path) -> None:
+    """Load a simple repo-local .env file into the process environment.
+
+    This loader is intentionally small and permissive enough for local development:
+    - ignores blank lines and comments
+    - trims surrounding whitespace around keys and values
+    - strips matching single/double quotes around values
+    - does not override already-exported environment variables
+    """
+
+    if not path.exists():
+        return
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key or key in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[key] = value
 
 
 if __name__ == "__main__":

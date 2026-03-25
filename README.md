@@ -30,7 +30,7 @@ What is implemented now:
 - A research-input JSON exporter that now emits story-oriented research jobs alongside the raw anomaly rows.
 - A separate research runner that consumes those jobs, caches normalized evidence in bounded SQLite storage, and writes structured research results JSON.
 - A sample-data runner so the pipeline works locally without external credentials.
-- An xAI-backed research source and synthesizer abstraction for X-first live research plus web corroboration.
+- An xAI SDK-backed research source and synthesizer abstraction for X-first live research plus web corroboration.
 
 What is not implemented yet:
 
@@ -41,20 +41,22 @@ What is not implemented yet:
 
 ## Run
 
+These examples assume you are using the uv-managed environment. If your shell is not already inside `.venv`, prefix commands with `uv run`.
+
 ```bash
-python3 main.py
+uv run python main.py
 ```
 
 Or, if you want to use the package entrypoint:
 
 ```bash
-python3 -m pmr.cli
+uv run python -m pmr.cli
 ```
 
 You can also point the CLI at a local JSON dataset:
 
 ```bash
-python3 main.py --source json --input-json data/markets.json
+uv run python main.py --source json --input-json data/markets.json
 ```
 
 ## Run Against Live Polymarket Data
@@ -62,7 +64,7 @@ python3 main.py --source json --input-json data/markets.json
 To fetch real active Polymarket markets, run the weekly detector, and write the anomaly payloads that the research stage consumes:
 
 ```bash
-python3 main.py \
+uv run python main.py \
   --source polymarket \
   --polymarket-max-markets 125 \
   --polymarket-max-pages 20 \
@@ -78,7 +80,7 @@ If you want the human-readable detector report for debugging, add either:
 If you want a reproducible local snapshot store as you evaluate live runs:
 
 ```bash
-python3 main.py \
+uv run python main.py \
   --source polymarket \
   --db-path data/pmr.sqlite3 \
   --snapshot-retention-days 120 \
@@ -91,7 +93,7 @@ python3 main.py \
 Then you can rerun reports from the stored dataset without hitting the live APIs:
 
 ```bash
-python3 main.py \
+uv run python main.py \
   --source stored \
   --db-path data/pmr.sqlite3 \
   --output-research-json out/stored-research-inputs.json
@@ -106,7 +108,7 @@ The live Polymarket flow now supports three refresh modes:
 Examples:
 
 ```bash
-python3 main.py \
+uv run python main.py \
   --source polymarket \
   --db-path data/pmr.sqlite3 \
   --polymarket-refresh-mode incremental \
@@ -114,7 +116,7 @@ python3 main.py \
 ```
 
 ```bash
-python3 main.py \
+uv run python main.py \
   --source polymarket \
   --db-path data/pmr.sqlite3 \
   --polymarket-refresh-mode backfill \
@@ -192,7 +194,7 @@ The research JSON export uses those hints to produce one research job per final 
 The detector stage now stops at `research-inputs.json`. The research stage is a separate CLI that consumes those jobs and writes the canonical structured results:
 
 ```bash
-python3 -m pmr.research_cli \
+uv run python -m pmr.research_cli \
   --input-json out/research-inputs.json \
   --db-path data/research.sqlite3 \
   --output-results-json out/research-results.json
@@ -201,16 +203,18 @@ python3 -m pmr.research_cli \
 Or with the package script:
 
 ```bash
-pmr-research \
+uv run pmr-research \
   --input-json out/research-inputs.json \
   --output-results-json out/research-results.json
 ```
 
-The xAI-backed research runner expects:
+The xAI SDK-backed research runner expects:
 
 - `XAI_API_KEY`
-- optional `PMR_XAI_MODEL`
+- optional `PMR_XAI_MODEL` (defaults to `grok-4.20-reasoning-latest`)
 - optional `XAI_BASE_URL`
+
+PMR now assumes the Grok ecosystem for the research stage. The default adapter uses the official `xai-sdk`, selects the best available reasoning model from a short Grok-first preference list, and uses built-in `x_search` plus `web_search` for retrieval.
 
 The research cache is explicitly bounded:
 
@@ -317,7 +321,7 @@ Core modules:
 - `pmr/research_payloads.py`: JSON serialization for research jobs and research results.
 - `pmr/research_engine.py`: query planning, evidence ranking, caching, and synthesis orchestration.
 - `pmr/research_store.py`: bounded SQLite cache for normalized evidence and structured research results.
-- `pmr/research_xai.py`: xAI-backed X-first research source and synthesizer.
+- `pmr/research_xai.py`: xAI SDK-backed X-first research source and synthesizer.
 - `pmr/story_groups.py`: story-family keys used for deduping related markets.
 - `pmr/storage.py`: SQLite snapshot persistence, bounded retention, and stored-data loading.
 - `pmr/universe_selection.py`: soft category-floor and overflow-based universe selection.
@@ -329,7 +333,7 @@ Core modules:
 
 The highest-value next milestones are:
 
-1. Validate the xAI-backed research runner on real jobs and tune the evidence prompts around X-vs-web balance.
+1. Validate the xAI SDK-backed research runner on real jobs and tune the evidence prompts around X-vs-web balance.
 2. Add a historical evaluation loop so thresholds and exclusion rules can be calibrated against real weeks of Polymarket behavior.
 3. Refine story-family clustering so closely related geopolitical and election markets can be grouped more intelligently before final composition.
 4. Add scheduling, delivery, and final newsletter/editor composition once the research output is stable.
@@ -337,5 +341,5 @@ The highest-value next milestones are:
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests
+uv run python -m unittest discover -s tests
 ```

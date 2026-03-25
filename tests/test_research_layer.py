@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -19,8 +20,10 @@ from pmr.research_engine import (
     build_research_query_plan,
     rank_evidence_for_job,
 )
+from pmr.research_cli import _load_dotenv_if_present
 from pmr.research_payloads import build_research_results_payload, load_research_jobs_from_payload
 from pmr.research_store import ResearchCacheConfig, ResearchStore
+from pmr.research_xai import _choose_best_model_name, _normalize_api_host
 
 
 class ResearchPayloadTests(unittest.TestCase):
@@ -86,6 +89,28 @@ class ResearchPayloadTests(unittest.TestCase):
         self.assertEqual(jobs[0].job_id, "job-1")
         self.assertEqual(jobs[0].primary_market.question, "Will Trump visit China by April 30?")
         self.assertEqual(jobs[0].related_markets[0].market_id, "market-2")
+
+    def test_dotenv_loader_trims_whitespace_and_preserves_existing_env(self) -> None:
+        original = os.environ.get("XAI_API_KEY")
+        os.environ.pop("XAI_API_KEY", None)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                env_path = Path(temp_dir) / ".env"
+                env_path.write_text('XAI_API_KEY = "demo-key"\nPMR_XAI_MODEL = grok-4.20-reasoning-latest\n')
+                _load_dotenv_if_present(env_path)
+                self.assertEqual(os.environ["XAI_API_KEY"], "demo-key")
+                self.assertEqual(os.environ["PMR_XAI_MODEL"], "grok-4.20-reasoning-latest")
+
+                os.environ["XAI_API_KEY"] = "already-set"
+                env_path.write_text("XAI_API_KEY=should-not-win\n")
+                _load_dotenv_if_present(env_path)
+                self.assertEqual(os.environ["XAI_API_KEY"], "already-set")
+        finally:
+            if original is None:
+                os.environ.pop("XAI_API_KEY", None)
+            else:
+                os.environ["XAI_API_KEY"] = original
+            os.environ.pop("PMR_XAI_MODEL", None)
 
 
 class ResearchEngineTests(unittest.TestCase):
@@ -155,6 +180,23 @@ class ResearchEngineTests(unittest.TestCase):
         self.assertEqual(batch.failed_jobs, 1)
         self.assertEqual(batch.results[0].status, "completed")
         self.assertEqual(batch.results[1].status, "failed")
+
+
+class XaiSdkAdapterHelperTests(unittest.TestCase):
+    def test_normalize_api_host_accepts_base_url(self) -> None:
+        self.assertEqual(_normalize_api_host("https://api.x.ai/v1"), "api.x.ai")
+        self.assertEqual(_normalize_api_host("https://api.x.ai:443/v1"), "api.x.ai:443")
+
+    def test_choose_best_model_name_prefers_latest_reasoning_candidate(self) -> None:
+        available = {"grok-4-1-fast-reasoning-latest", "grok-4.20", "grok-3-mini"}
+        self.assertEqual(_choose_best_model_name(available), "grok-4.20")
+
+    def test_choose_best_model_name_falls_back_to_default_when_unknown(self) -> None:
+        self.assertEqual(_choose_best_model_name({"grok-3-mini"}), "grok-4.20-reasoning-latest")
+
+    def test_choose_best_model_name_uses_any_grok4_reasoning_before_multi_agent(self) -> None:
+        available = {"grok-4-fast-reasoning", "grok-4.20-multi-agent-latest"}
+        self.assertEqual(_choose_best_model_name(available), "grok-4-fast-reasoning")
 
 
 class ResearchStoreTests(unittest.TestCase):
