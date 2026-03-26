@@ -8,14 +8,39 @@ The current repository provides a working first pass of that flow:
 
 1. Filter markets by category and liquidity.
 2. Detect weekly repricing events that happened anywhere inside the last 7 days.
-3. Export typed research jobs for a second-stage research pipeline.
-4. Run an X-first research pass and persist structured research results.
+3. Export typed story-development jobs for a second-stage Grok-backed workflow.
+4. Run an X-first story-development pass and persist structured story drafts.
+
+## Product Thesis
+
+PMR is not trying to compete with a general news feed. The product thesis is narrower and more valuable:
+
+- prediction markets provide the significance filter,
+- real price moves tell us where market perception changed,
+- and AI is used to explain why that change happened.
+
+The report is designed around two distinct story classes:
+
+1. Resolution stories
+
+- These are markets whose move is driven by event-concluding news.
+- The core value is not discovering hidden news. It is quantifying surprise.
+- A good PMR resolution story should answer: what happened, how decisively did it resolve the market, and how wrong or right was the market beforehand?
+
+2. Repricing stories
+
+- These are the more important long-run product category.
+- They reflect a meaningful shift in perceived probability without a clean resolved outcome.
+- They are often driven by rumors, negotiation signals, sentiment shifts, leaks, social-media chatter, or several weak signals arriving together.
+- A good PMR repricing story should answer: what most plausibly changed market perception, how confident are we, and what remains uncertain?
+
+This is why PMR starts from markets rather than headlines. The system is meant to cut through sensationalism and noise by asking a narrower question: where did traders with money at risk materially change their minds?
 
 ## Current Scope
 
 What is implemented now:
 
-- A domain model for markets, snapshots, detected repricing events, research jobs, normalized evidence, and structured research results.
+- A domain model for markets, snapshots, detected repricing events, story-development jobs, normalized evidence, and structured story drafts.
 - A detection engine that scores moves over the last 7 days.
 - A live Polymarket provider that fetches active markets from Gamma, price history from the public CLOB API, and open interest from the public Data API.
 - A local SQLite snapshot store with retention pruning for live Polymarket runs.
@@ -27,10 +52,11 @@ What is implemented now:
 - Story-family deduping so related contract variants collapse into one final research candidate.
 - Editorial hints on each anomaly, including whether the move looks more like a live repricing, a resolved surprise, or a late-stage resolution.
 - An optional detector-only Markdown report generator for debugging and tuning.
-- A research-input JSON exporter that now emits story-oriented research jobs alongside the raw anomaly rows.
-- A separate research runner that consumes those jobs, caches normalized evidence in bounded SQLite storage, and writes structured research results JSON.
+- A research-input JSON exporter that now emits story-oriented jobs alongside the raw anomaly rows.
+- Per-story price-action packets, including 8-hour traces over the week, largest-move windows, and surprise metrics for resolution stories.
+- A separate Grok-backed story-development runner that consumes those jobs, routes resolution stories and repricing stories differently, caches normalized evidence in bounded SQLite storage, and writes structured story drafts JSON.
 - A sample-data runner so the pipeline works locally without external credentials.
-- An xAI SDK-backed research source and synthesizer abstraction for X-first live research plus web corroboration.
+- An xAI SDK-backed story worker for X-first live research plus web corroboration.
 
 What is not implemented yet:
 
@@ -61,7 +87,7 @@ uv run python main.py --source json --input-json data/markets.json
 
 ## Run Against Live Polymarket Data
 
-To fetch real active Polymarket markets, run the weekly detector, and write the anomaly payloads that the research stage consumes:
+To fetch real active Polymarket markets, run the weekly detector, and write the anomaly payloads that the story-development stage consumes:
 
 ```bash
 uv run python main.py \
@@ -153,7 +179,7 @@ The local dataset is kept bounded by:
 
 When you run `--source polymarket`, PMR first fetches the live delta or backfill chunk, writes it into SQLite, prunes old data, and then runs detection on the merged stored dataset. That keeps reports stable while avoiding repeated full-history pulls.
 
-The current default operating point is a `125`-market scoring universe and up to `12` final anomaly candidates per run. Those numbers are intended to keep the queue broad enough to catch more medium-liquidity stories without overwhelming the downstream research layer.
+The current default operating point is a `125`-market scoring universe and up to `12` final anomaly candidates per run. Those numbers are intended to keep the queue broad enough to catch more medium-liquidity stories without overwhelming the downstream story-development layer.
 
 When you request the optional detector Markdown report, PMR appends a diagnostics section that explains:
 
@@ -189,9 +215,9 @@ The research JSON export uses those hints to produce one research job per final 
 - a short investigation brief,
 - and the raw detector features that explain why the market was flagged.
 
-## Run The Research Layer
+## Run The Story-Development Layer
 
-The detector stage now stops at `research-inputs.json`. The research stage is a separate CLI that consumes those jobs and writes the canonical structured results:
+The detector stage now stops at `research-inputs.json`. The story-development stage is a separate CLI that consumes those jobs and writes canonical structured story drafts:
 
 ```bash
 uv run python -m pmr.research_cli \
@@ -208,15 +234,20 @@ uv run pmr-research \
   --output-results-json out/research-results.json
 ```
 
-The xAI SDK-backed research runner expects:
+The xAI SDK-backed story-development runner expects:
 
 - `XAI_API_KEY`
-- optional `PMR_XAI_MODEL` (defaults to `grok-4.20-reasoning-latest`)
+- optional `PMR_XAI_MODEL` to force one model across both lanes
 - optional `XAI_BASE_URL`
 
-PMR now assumes the Grok ecosystem for the research stage. The default adapter uses the official `xai-sdk`, selects the best available reasoning model from a short Grok-first preference list, and uses built-in `x_search` plus `web_search` for retrieval.
+PMR now assumes the Grok ecosystem for the story-development stage. The default adapter uses the official `xai-sdk`, uses built-in `x_search` plus `web_search`, and routes stories by type:
 
-The research cache is explicitly bounded:
+- `resolution_story` -> Grok 4.20 reasoning
+- `repricing_story` -> Grok 4.20 multi-agent
+
+You can still override that routing with `PMR_XAI_MODEL` if you want to force one model for a debugging run.
+
+The story-development cache is explicitly bounded:
 
 - only normalized evidence metadata plus short excerpts are stored
 - raw evidence expires after 30 days by default
@@ -308,6 +339,13 @@ On top of the anomaly score, PMR now adds lightweight editorial metadata. These 
 - `resolved_surprise`: the market moved into an extreme zone from a meaningfully uncertain starting point
 - `late_stage_resolution`: the market mostly confirmed an outcome that was already leaning strongly one way
 
+The downstream handoff now also includes a compact weekly price-action packet so the story-development worker can align evidence with the actual market move:
+
+- 8-hour price trace across the 7-day window
+- largest move window timing
+- window open / close / high / low probabilities
+- resolution surprise metrics when applicable
+
 ## Architecture
 
 Core modules:
@@ -318,10 +356,10 @@ Core modules:
 - `pmr/detector.py`: weekly event extraction, baseline normalization, and ranking.
 - `pmr/polymarket.py`: public Polymarket HTTP client.
 - `pmr/providers.py`: data-provider interfaces plus JSON, static, and Polymarket implementations.
-- `pmr/research_payloads.py`: JSON serialization for research jobs and research results.
-- `pmr/research_engine.py`: query planning, evidence ranking, caching, and synthesis orchestration.
-- `pmr/research_store.py`: bounded SQLite cache for normalized evidence and structured research results.
-- `pmr/research_xai.py`: xAI SDK-backed X-first research source and synthesizer.
+- `pmr/research_payloads.py`: JSON serialization for story-development jobs and story-draft outputs.
+- `pmr/research_engine.py`: query planning, evidence ranking, caching, and story-development orchestration.
+- `pmr/research_store.py`: bounded SQLite cache for normalized evidence and structured story drafts.
+- `pmr/research_xai.py`: xAI SDK-backed X-first story worker with model routing for resolution vs repricing stories.
 - `pmr/story_groups.py`: story-family keys used for deduping related markets.
 - `pmr/storage.py`: SQLite snapshot persistence, bounded retention, and stored-data loading.
 - `pmr/universe_selection.py`: soft category-floor and overflow-based universe selection.
@@ -333,10 +371,10 @@ Core modules:
 
 The highest-value next milestones are:
 
-1. Validate the xAI SDK-backed research runner on real jobs and tune the evidence prompts around X-vs-web balance.
-2. Add a historical evaluation loop so thresholds and exclusion rules can be calibrated against real weeks of Polymarket behavior.
-3. Refine story-family clustering so closely related geopolitical and election markets can be grouped more intelligently before final composition.
-4. Add scheduling, delivery, and final newsletter/editor composition once the research output is stable.
+1. Improve story-development quality by tightening evidence selection, penalizing weak market-commentary posts, and forcing stronger contradictory-evidence handling.
+2. Build the editor/composer layer that reviews all weekly story drafts, decides which deserve inclusion, merges overlaps, and produces the final report.
+3. Add a historical evaluation loop so thresholds and exclusion rules can be calibrated against real weeks of Polymarket behavior.
+4. Add scheduling and delivery once the story-development and editor outputs are stable.
 
 ## Testing
 

@@ -14,13 +14,13 @@ from pmr.research_store import ResearchCacheConfig, ResearchStore
 from pmr.research_xai import XaiResearchSource, XaiResearchSynthesizer
 
 
-PROMPT_VERSION = "pmr_research_v2_xai_sdk"
-PROVIDER_NAME = "xai_sdk_x_first"
+PROMPT_VERSION = "pmr_story_development_v1"
+PROVIDER_NAME = "xai_sdk_story_developer"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run the PMR research layer on a previously exported research-jobs JSON file."
+        description="Run the PMR story-development layer on a previously exported research-jobs JSON file."
     )
     parser.add_argument(
         "--input-json",
@@ -32,13 +32,13 @@ def main() -> int:
         "--db-path",
         type=Path,
         default=Path("data/research.sqlite3"),
-        help="SQLite path for cached evidence and synthesized research results.",
+        help="SQLite path for cached evidence and synthesized story-development outputs.",
     )
     parser.add_argument(
         "--output-results-json",
         type=Path,
         default=Path("out/research-results.json"),
-        help="Path to write the structured research results JSON.",
+        help="Path to write the structured story-draft outputs JSON.",
     )
     parser.add_argument(
         "--max-jobs",
@@ -71,7 +71,7 @@ def main() -> int:
         "--result-retention-days",
         type=int,
         default=90,
-        help="How long to retain synthesized research results in the cache.",
+        help="How long to retain synthesized story-development outputs in the cache.",
     )
     parser.add_argument(
         "--max-evidence-items-per-job",

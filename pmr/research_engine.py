@@ -26,12 +26,12 @@ class ResearchSynthesizer(Protocol):
         prompt_version: str,
         generated_at: datetime,
     ) -> ResearchResult:
-        """Summarize normalized evidence into one structured research result."""
+        """Turn normalized evidence into one structured story-development output."""
 
 
 @dataclass(slots=True)
 class HeuristicResearchSynthesizer:
-    """Deterministic synthesizer used for tests and fallback paths."""
+    """Deterministic story drafter used for tests and fallback paths."""
 
     def summarize(
         self,
@@ -52,11 +52,26 @@ class HeuristicResearchSynthesizer:
                 cache_key=cache_key,
                 provider=provider_name,
                 prompt_version=prompt_version,
+                model_name="heuristic",
+                workflow_type=job.workflow_type,
                 status="insufficient_evidence",
                 explanation_class="speculative",
                 confidence=0.24,
                 most_plausible_explanation="The live research pass did not surface enough evidence to explain the repricing confidently.",
                 why_market_moved=job.why_flagged,
+                price_action_summary=_build_price_action_summary(job),
+                surprise_assessment=_build_surprise_assessment(job),
+                main_narrative="The story remains underdeveloped because the current source mix did not produce enough timely evidence.",
+                alternative_explanations=(
+                    "The move may reflect rumor propagation or low-visibility reporting not captured by the current search pass.",
+                ),
+                note_to_editor="Evidence is too thin for a confident story. Treat this as a watchlist item unless a stronger second pass surfaces new reporting.",
+                draft_headline=job.family_label,
+                draft_markdown=_build_fallback_draft(
+                    job,
+                    headline=job.family_label,
+                    narrative="Evidence was too thin to support a publication-ready draft.",
+                ),
                 key_evidence=(),
                 contradictory_evidence=(),
                 open_questions=(
@@ -105,16 +120,33 @@ class HeuristicResearchSynthesizer:
             open_questions.append("More evidence is needed before treating this as a settled explanation.")
         if top_contradictory:
             open_questions.append("Contradictory items suggest the story may still be developing.")
+        headline = _build_heuristic_headline(job)
+        main_narrative = explanation
+        note_to_editor = (
+            "This is a fallback heuristic draft. Use it for testing and plumbing only, not as a publication-grade story."
+        )
         result = ResearchResult(
             job_id=job.job_id,
             cache_key=cache_key,
             provider=provider_name,
             prompt_version=prompt_version,
+            model_name="heuristic",
+            workflow_type=job.workflow_type,
             status=status,
             explanation_class=explanation_class,
             confidence=confidence,
             most_plausible_explanation=explanation,
             why_market_moved=job.why_flagged,
+            price_action_summary=_build_price_action_summary(job),
+            surprise_assessment=_build_surprise_assessment(job),
+            main_narrative=main_narrative,
+            alternative_explanations=tuple(
+                "Contradictory or delayed signals could still change the story."
+                for _ in top_contradictory[:1]
+            ),
+            note_to_editor=note_to_editor,
+            draft_headline=headline,
+            draft_markdown=_build_fallback_draft(job, headline=headline, narrative=main_narrative),
             key_evidence=top_support,
             contradictory_evidence=top_contradictory,
             open_questions=tuple(open_questions),
@@ -125,7 +157,7 @@ class HeuristicResearchSynthesizer:
 
 @dataclass(slots=True)
 class ResearchEngine:
-    """Coordinate query planning, evidence collection, caching, and synthesis."""
+    """Coordinate query planning, evidence collection, caching, and story drafting."""
 
     source: ResearchSource
     synthesizer: ResearchSynthesizer
@@ -198,11 +230,20 @@ class ResearchEngine:
                 cache_key=cache_key,
                 provider=self.provider_name,
                 prompt_version=self.prompt_version,
+                model_name="unavailable",
+                workflow_type=job.workflow_type,
                 status="failed",
                 explanation_class=None,
                 confidence=0.0,
                 most_plausible_explanation="",
                 why_market_moved=job.why_flagged,
+                price_action_summary=_build_price_action_summary(job),
+                surprise_assessment=_build_surprise_assessment(job),
+                main_narrative="",
+                alternative_explanations=(),
+                note_to_editor="The story-development run failed before synthesis completed.",
+                draft_headline=job.family_label,
+                draft_markdown="",
                 key_evidence=(),
                 contradictory_evidence=(),
                 open_questions=("The research run failed before completing synthesis.",),
@@ -229,6 +270,20 @@ def build_research_query_plan(job: ResearchJob) -> ResearchQueryPlan:
     if job.primary_market.event_title:
         x_queries.append(job.primary_market.event_title)
     x_queries.extend(related_terms)
+    if job.workflow_type == "resolution_story":
+        x_queries.extend(
+            [
+                f"{family_term} results",
+                f"{family_term} exit polls",
+            ]
+        )
+    else:
+        x_queries.extend(
+            [
+                f"{family_term} rumor",
+                f"{family_term} talks",
+            ]
+        )
     web_queries = [
         family_term,
         primary_question,
@@ -236,6 +291,10 @@ def build_research_query_plan(job: ResearchJob) -> ResearchQueryPlan:
     ]
     if job.primary_market.event_title:
         web_queries.append(f"{job.primary_market.event_title} analysis")
+    if job.workflow_type == "resolution_story":
+        web_queries.append(f"{family_term} results")
+    else:
+        web_queries.append(f"{family_term} rumors")
     time_window_start = max(
         job.primary_market.detection_window_start - timedelta(days=1),
         focus_timestamp - timedelta(days=3),
@@ -326,3 +385,48 @@ def _temporal_proximity_score(observed_at: datetime, focus_timestamp: datetime) 
 
 def _clean_query(value: str) -> str:
     return " ".join(value.split())
+
+
+def _build_price_action_summary(job: ResearchJob) -> str:
+    market = job.primary_market
+    return (
+        f"Over the 7-day detection window, the market moved from {market.window_open_probability * 100:.1f}% "
+        f"to {market.window_close_probability * 100:.1f}%, with a weekly range of {market.weekly_range * 100:.1f} "
+        f"points and a max 24h move of {market.max_abs_move_24h * 100:.1f} points."
+    )
+
+
+def _build_surprise_assessment(job: ResearchJob) -> str:
+    context = job.primary_market.price_context
+    if job.workflow_type == "repricing_story":
+        return (
+            "This looks more like a broad repricing story than a resolved outcome. The key question is what changed "
+            "market perception enough to move the odds materially without fully settling the event."
+        )
+    if context.surprise_points is None:
+        return "The move looks resolution-driven, but the surprise level could not be quantified cleanly from the current packet."
+    return (
+        f"This looks like a {context.surprise_label or 'measurable'} resolution surprise. "
+        f"Using the window-open probability as the pre-resolution baseline, the outcome surprised the market by "
+        f"about {context.surprise_points:.1f} percentage points."
+    )
+
+
+def _build_heuristic_headline(job: ResearchJob) -> str:
+    if job.workflow_type == "repricing_story":
+        return f"{job.family_label}: Odds Repriced Sharply Inside One Week"
+    return f"{job.family_label}: Market Resolution and Surprise Assessment"
+
+
+def _build_fallback_draft(job: ResearchJob, *, headline: str, narrative: str) -> str:
+    return "\n".join(
+        (
+            f"# {headline}",
+            "",
+            _build_price_action_summary(job),
+            "",
+            narrative,
+            "",
+            _build_surprise_assessment(job),
+        )
+    )

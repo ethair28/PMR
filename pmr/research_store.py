@@ -24,7 +24,7 @@ class ResearchCacheConfig:
 
 @dataclass(slots=True)
 class ResearchStore:
-    """SQLite-backed cache for normalized evidence and synthesized research results."""
+    """SQLite-backed cache for normalized evidence and synthesized story outputs."""
 
     path: Path
     cache_config: ResearchCacheConfig = ResearchCacheConfig()
@@ -69,11 +69,20 @@ class ResearchStore:
             cache_key=row["cache_key"],
             provider=row["provider"],
             prompt_version=row["prompt_version"],
+            model_name=row["model_name"] or "unknown",
+            workflow_type=row["workflow_type"] or "repricing_story",
             status=row["status"],
             explanation_class=row["explanation_class"],
             confidence=float(row["confidence"]),
             most_plausible_explanation=row["most_plausible_explanation"],
             why_market_moved=row["why_market_moved"],
+            price_action_summary=row["price_action_summary"] or "",
+            surprise_assessment=row["surprise_assessment"] or "",
+            main_narrative=row["main_narrative"] or "",
+            alternative_explanations=tuple(json.loads(row["alternative_explanations_json"] or "[]")),
+            note_to_editor=row["note_to_editor"] or "",
+            draft_headline=row["draft_headline"] or "",
+            draft_markdown=row["draft_markdown"] or "",
             key_evidence=key_evidence,
             contradictory_evidence=contradictory_evidence,
             open_questions=tuple(json.loads(row["open_questions_json"])),
@@ -94,27 +103,45 @@ class ResearchStore:
                     job_id,
                     provider,
                     prompt_version,
+                    model_name,
+                    workflow_type,
                     detection_window_end,
                     status,
                     explanation_class,
                     confidence,
                     most_plausible_explanation,
                     why_market_moved,
+                    price_action_summary,
+                    surprise_assessment,
+                    main_narrative,
+                    alternative_explanations_json,
+                    note_to_editor,
+                    draft_headline,
+                    draft_markdown,
                     open_questions_json,
                     key_evidence_json,
                     contradictory_evidence_json,
                     completed_at,
                     error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     provider = excluded.provider,
                     prompt_version = excluded.prompt_version,
+                    model_name = excluded.model_name,
+                    workflow_type = excluded.workflow_type,
                     detection_window_end = excluded.detection_window_end,
                     status = excluded.status,
                     explanation_class = excluded.explanation_class,
                     confidence = excluded.confidence,
                     most_plausible_explanation = excluded.most_plausible_explanation,
                     why_market_moved = excluded.why_market_moved,
+                    price_action_summary = excluded.price_action_summary,
+                    surprise_assessment = excluded.surprise_assessment,
+                    main_narrative = excluded.main_narrative,
+                    alternative_explanations_json = excluded.alternative_explanations_json,
+                    note_to_editor = excluded.note_to_editor,
+                    draft_headline = excluded.draft_headline,
+                    draft_markdown = excluded.draft_markdown,
                     open_questions_json = excluded.open_questions_json,
                     key_evidence_json = excluded.key_evidence_json,
                     contradictory_evidence_json = excluded.contradictory_evidence_json,
@@ -126,12 +153,21 @@ class ResearchStore:
                     result.job_id,
                     result.provider,
                     result.prompt_version,
+                    result.model_name,
+                    result.workflow_type,
                     job.primary_market.detection_window_end.isoformat(),
                     result.status,
                     result.explanation_class,
                     result.confidence,
                     result.most_plausible_explanation,
                     result.why_market_moved,
+                    result.price_action_summary,
+                    result.surprise_assessment,
+                    result.main_narrative,
+                    json.dumps(list(result.alternative_explanations)),
+                    result.note_to_editor,
+                    result.draft_headline,
+                    result.draft_markdown,
                     json.dumps(list(result.open_questions)),
                     json.dumps([_serialize_evidence_item(item) for item in key_evidence]),
                     json.dumps([_serialize_evidence_item(item) for item in contradictory_evidence]),
@@ -221,12 +257,21 @@ class ResearchStore:
                 job_id TEXT NOT NULL,
                 provider TEXT NOT NULL,
                 prompt_version TEXT NOT NULL,
+                model_name TEXT,
+                workflow_type TEXT,
                 detection_window_end TEXT NOT NULL,
                 status TEXT NOT NULL,
                 explanation_class TEXT,
                 confidence REAL NOT NULL,
                 most_plausible_explanation TEXT NOT NULL,
                 why_market_moved TEXT NOT NULL,
+                price_action_summary TEXT,
+                surprise_assessment TEXT,
+                main_narrative TEXT,
+                alternative_explanations_json TEXT,
+                note_to_editor TEXT,
+                draft_headline TEXT,
+                draft_markdown TEXT,
                 open_questions_json TEXT NOT NULL,
                 key_evidence_json TEXT NOT NULL,
                 contradictory_evidence_json TEXT NOT NULL,
@@ -263,6 +308,7 @@ class ResearchStore:
             ON research_evidence(collected_at);
             """
         )
+        self._ensure_result_columns(connection)
 
     def _prune_versions(self, connection: sqlite3.Connection, *, job_id: str, provider: str) -> None:
         rows = connection.execute(
@@ -299,6 +345,29 @@ class ResearchStore:
                 connection.commit()
             connection.execute("PRAGMA incremental_vacuum")
             connection.execute("VACUUM")
+
+    def _ensure_result_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(research_results)").fetchall()
+        }
+        required_columns = {
+            "model_name": "TEXT",
+            "workflow_type": "TEXT",
+            "price_action_summary": "TEXT",
+            "surprise_assessment": "TEXT",
+            "main_narrative": "TEXT",
+            "alternative_explanations_json": "TEXT",
+            "note_to_editor": "TEXT",
+            "draft_headline": "TEXT",
+            "draft_markdown": "TEXT",
+        }
+        for column_name, column_type in required_columns.items():
+            if column_name in columns:
+                continue
+            connection.execute(
+                f"ALTER TABLE research_results ADD COLUMN {column_name} {column_type}"
+            )
 
 
 def _serialize_evidence_item(item: EvidenceItem) -> dict[str, object]:

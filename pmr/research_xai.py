@@ -11,15 +11,21 @@ from xai_sdk import Client
 from xai_sdk.chat import system, user
 from xai_sdk.tools import web_search, x_search
 
-from pmr.models import EvidenceItem, ResearchJob, ResearchQueryPlan, ResearchResult
+from pmr.models import EvidenceItem, ResearchJob, ResearchQueryPlan, ResearchResult, StoryWorkflowType
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
-DEFAULT_XAI_MODEL = "grok-4.20-reasoning-latest"
-DEFAULT_XAI_MODEL_CANDIDATES = (
+DEFAULT_REASONING_MODEL = "grok-4.20-reasoning-latest"
+DEFAULT_MULTI_AGENT_MODEL = "grok-4.20-multi-agent-latest"
+DEFAULT_XAI_MODEL = DEFAULT_REASONING_MODEL
+DEFAULT_REASONING_MODEL_CANDIDATES = (
     "grok-4.20-reasoning-latest",
     "grok-4.20",
     "grok-4-1-fast-reasoning-latest",
+)
+DEFAULT_MULTI_AGENT_MODEL_CANDIDATES = (
+    "grok-4.20-multi-agent-latest",
+    "grok-4.20-multi-agent",
 )
 
 
@@ -46,6 +52,13 @@ class _SynthesisEnvelope(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     most_plausible_explanation: str = ""
     why_market_moved: str = ""
+    price_action_summary: str = ""
+    surprise_assessment: str = ""
+    main_narrative: str = ""
+    alternative_explanations: list[str] = Field(default_factory=list)
+    note_to_editor: str = ""
+    draft_headline: str = ""
+    draft_markdown: str = ""
     open_questions: list[str] = Field(default_factory=list)
     error_message: str | None = None
 
@@ -57,7 +70,8 @@ class _XaiSdkAdapterBase:
     base_url: str = DEFAULT_XAI_BASE_URL
     timeout_seconds: int = 60
     _client: Client | None = field(default=None, init=False, repr=False)
-    _resolved_model: str | None = field(default=None, init=False, repr=False)
+    _available_model_names: set[str] | None = field(default=None, init=False, repr=False)
+    _resolved_models: dict[str, str] = field(default_factory=dict, init=False, repr=False)
 
     def _get_client(self) -> Client:
         if self._client is None:
@@ -68,14 +82,17 @@ class _XaiSdkAdapterBase:
             )
         return self._client
 
-    def _get_model(self) -> str:
+    def _get_model_for_job(self, job: ResearchJob) -> str:
         if self.model:
             return self.model
-        if self._resolved_model is not None:
-            return self._resolved_model
-        available = _list_language_model_names(self._get_client())
-        self._resolved_model = _choose_best_model_name(available)
-        return self._resolved_model
+        workflow_key = job.workflow_type
+        if workflow_key in self._resolved_models:
+            return self._resolved_models[workflow_key]
+        if self._available_model_names is None:
+            self._available_model_names = _list_language_model_names(self._get_client())
+        resolved = _choose_best_model_name(self._available_model_names, workflow_type=job.workflow_type)
+        self._resolved_models[workflow_key] = resolved
+        return resolved
 
 
 @dataclass(slots=True)
@@ -93,8 +110,9 @@ class XaiResearchSource(_XaiSdkAdapterBase):
 
     def search(self, job: ResearchJob, query_plan: ResearchQueryPlan) -> Sequence[EvidenceItem]:
         prompt = _build_source_prompt(job, query_plan, max_evidence_items=self.max_evidence_items)
+        model_name = self._get_model_for_job(job)
         chat = self._get_client().chat.create(
-            model=self._get_model(),
+            model=model_name,
             temperature=0.1,
             tools=[
                 x_search(
@@ -105,6 +123,8 @@ class XaiResearchSource(_XaiSdkAdapterBase):
             ],
             tool_choice="required",
             store_messages=False,
+            parallel_tool_calls=True,
+            **_multi_agent_kwargs(model_name),
         )
         chat.append(system(SOURCE_SYSTEM_PROMPT))
         chat.append(user(prompt))
@@ -151,10 +171,12 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
         prompt_version: str,
         generated_at: datetime,
     ) -> ResearchResult:
+        model_name = self._get_model_for_job(job)
         chat = self._get_client().chat.create(
-            model=self._get_model(),
+            model=model_name,
             temperature=0.1,
             store_messages=False,
+            **_multi_agent_kwargs(model_name),
         )
         chat.append(system(SYNTHESIS_SYSTEM_PROMPT))
         chat.append(
@@ -172,11 +194,20 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
             cache_key=cache_key,
             provider=provider_name,
             prompt_version=prompt_version,
+            model_name=model_name,
+            workflow_type=job.workflow_type,
             status=parsed.status,
             explanation_class=parsed.explanation_class,
             confidence=_clamp_float(parsed.confidence, default=0.0),
             most_plausible_explanation=parsed.most_plausible_explanation.strip(),
             why_market_moved=parsed.why_market_moved.strip(),
+            price_action_summary=parsed.price_action_summary.strip(),
+            surprise_assessment=parsed.surprise_assessment.strip(),
+            main_narrative=parsed.main_narrative.strip(),
+            alternative_explanations=tuple(item.strip() for item in parsed.alternative_explanations if item.strip()),
+            note_to_editor=parsed.note_to_editor.strip(),
+            draft_headline=parsed.draft_headline.strip(),
+            draft_markdown=parsed.draft_markdown.strip(),
             key_evidence=tuple(evidence[:5]),
             contradictory_evidence=tuple(item for item in evidence if item.stance == "contradictory")[:3],
             open_questions=tuple(item.strip() for item in parsed.open_questions if item.strip()),
@@ -185,19 +216,19 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
         )
 
 
-SOURCE_SYSTEM_PROMPT = """You are a research retriever for a prediction-market reporting system.
+SOURCE_SYSTEM_PROMPT = """You are a research retriever for a prediction-market story-development system.
 
 Use x_search first and web_search second. Gather evidence about why the market repriced near the supplied move window.
 
-Return only structured data matching the provided schema. Do not invent URLs, authors, or publication dates. If evidence is weak, return fewer items rather than guessing. Prefer evidence that is temporally close to the move timestamp and clearly relevant to the market question.
+Return only structured data matching the provided schema. Do not invent URLs, authors, or publication dates. If evidence is weak, return fewer items rather than guessing. Prefer evidence that is temporally close to the move timestamp and clearly relevant to the market question. Include at least one contradictory or cautionary item when the evidence is contested or incomplete.
 """
 
 
-SYNTHESIS_SYSTEM_PROMPT = """You are a research synthesizer for a prediction-market reporting system.
+SYNTHESIS_SYSTEM_PROMPT = """You are a prediction-market story developer.
 
-You will receive a market, a search plan, and normalized evidence items that already came from xAI search tools. Return only structured data matching the provided schema.
+You will receive a market, a search plan, weekly price-action context, and normalized evidence items that already came from xAI search tools. Return only structured data matching the provided schema.
 
-If the evidence is weak or conflicting, use "insufficient_evidence" or "speculative" rather than overstating certainty.
+If the story is a resolution story, quantify the surprise clearly. If it is a repricing story, focus on the best narrative for why market perception shifted without claiming false certainty. Always leave a note for the editor. If the evidence is weak or conflicting, use "insufficient_evidence" or "speculative" rather than overstating certainty.
 """
 
 
@@ -205,6 +236,7 @@ def _build_source_prompt(job: ResearchJob, query_plan: ResearchQueryPlan, *, max
     return (
         f"Investigate this repricing and return at most {max_evidence_items} normalized evidence items.\n\n"
         f"Story: {job.family_label}\n"
+        f"Workflow type: {job.workflow_type}\n"
         f"Story type hint: {job.story_type_hint}\n"
         f"Editorial priority hint: {job.editorial_priority_hint}\n"
         f"Investigation question: {job.investigation_question}\n"
@@ -217,11 +249,14 @@ def _build_source_prompt(job: ResearchJob, query_plan: ResearchQueryPlan, *, max
         f"{job.primary_market.detection_window_end.isoformat()}\n"
         f"Max move timestamp: "
         f"{job.primary_market.max_move_timestamp.isoformat() if job.primary_market.max_move_timestamp else 'n/a'}\n"
+        f"Weekly price trace (8h): {_format_price_trace(job)}\n"
+        f"Surprise context: {_format_surprise_context(job)}\n"
         f"Focus points: {', '.join(query_plan.focus_points) if query_plan.focus_points else 'none'}\n"
         f"X queries: {', '.join(query_plan.x_queries)}\n"
         f"Web queries: {', '.join(query_plan.web_queries)}\n"
         f"Related markets: {_format_related_markets(job)}\n"
-        "Favor posts/articles that directly explain a change in perceived probability, not just generic background."
+        "Favor posts/articles that directly explain a change in perceived probability, not just generic background. "
+        "Treat posts that only comment on Polymarket itself as weak unless they point to underlying reporting or information flow."
     )
 
 
@@ -233,12 +268,14 @@ def _build_synthesis_prompt(
 ) -> str:
     lines = [
         f"Story: {job.family_label}",
+        f"Workflow type: {job.workflow_type}",
         f"Story type hint: {job.story_type_hint}",
         f"Investigation question: {job.investigation_question}",
         f"Why flagged: {job.why_flagged}",
         f"Primary market: {job.primary_market.question}",
         f"Detection window: {query_plan.time_window_start.isoformat()} to {query_plan.time_window_end.isoformat()}",
         f"Focus timestamp: {query_plan.focus_timestamp.isoformat() if query_plan.focus_timestamp else 'n/a'}",
+        f"Price action summary packet: {_format_price_context(job)}",
         "Evidence:",
     ]
     for index, item in enumerate(evidence, start=1):
@@ -256,6 +293,48 @@ def _format_related_markets(job: ResearchJob) -> str:
     if not job.related_markets:
         return "none"
     return "; ".join(f"{item.market_id}: {item.question}" for item in job.related_markets)
+
+
+def _format_price_trace(job: ResearchJob) -> str:
+    if not job.primary_market.price_context.trace_points:
+        return "none"
+    return "; ".join(
+        (
+            f"{item.observed_at.isoformat()}={item.probability * 100:.1f}%"
+            + (
+                f" ({item.move_since_previous * 100:+.1f} pts)"
+                if item.move_since_previous is not None
+                else ""
+            )
+        )
+        for item in job.primary_market.price_context.trace_points
+    )
+
+
+def _format_surprise_context(job: ResearchJob) -> str:
+    context = job.primary_market.price_context
+    if context.surprise_points is None:
+        return "repricing_story or no clean resolution surprise metric"
+    return (
+        f"reference={context.surprise_reference_probability * 100:.1f}% "
+        f"surprise={context.surprise_points:.1f} pts "
+        f"label={context.surprise_label or 'n/a'}"
+    )
+
+
+def _format_price_context(job: ResearchJob) -> str:
+    context = job.primary_market.price_context
+    return (
+        f"open={job.primary_market.window_open_probability * 100:.1f}% "
+        f"close={job.primary_market.window_close_probability * 100:.1f}% "
+        f"high={job.primary_market.window_high_probability * 100:.1f}% "
+        f"low={job.primary_market.window_low_probability * 100:.1f}% "
+        f"range={job.primary_market.weekly_range * 100:.1f} pts "
+        f"max24h={job.primary_market.max_abs_move_24h * 100:.1f} pts "
+        f"largest_window={context.largest_move_window_hours}h "
+        f"from={context.largest_move_window_start.isoformat() if context.largest_move_window_start else 'n/a'} "
+        f"to={context.largest_move_window_end.isoformat() if context.largest_move_window_end else 'n/a'}"
+    )
 
 
 def _normalize_api_host(value: str) -> str:
@@ -287,10 +366,21 @@ def _list_language_model_names(client: Client) -> set[str] | None:
     return names
 
 
-def _choose_best_model_name(available_names: set[str] | None) -> str:
+def _choose_best_model_name(
+    available_names: set[str] | None,
+    *,
+    workflow_type: StoryWorkflowType = "resolution_story",
+) -> str:
     if not available_names:
-        return DEFAULT_XAI_MODEL
-    for candidate in DEFAULT_XAI_MODEL_CANDIDATES:
+        return DEFAULT_MULTI_AGENT_MODEL if workflow_type == "repricing_story" else DEFAULT_REASONING_MODEL
+    if workflow_type == "repricing_story":
+        for candidate in DEFAULT_MULTI_AGENT_MODEL_CANDIDATES:
+            if candidate in available_names:
+                return candidate
+        grok4_multi_agent = sorted(name for name in available_names if "multi-agent" in name and name.startswith("grok-4"))
+        if grok4_multi_agent:
+            return grok4_multi_agent[0]
+    for candidate in DEFAULT_REASONING_MODEL_CANDIDATES:
         if candidate in available_names:
             return candidate
     grok4_reasoning = sorted(
@@ -305,7 +395,13 @@ def _choose_best_model_name(available_names: set[str] | None) -> str:
     )
     if grok4_general:
         return grok4_general[0]
-    return DEFAULT_XAI_MODEL
+    return DEFAULT_MULTI_AGENT_MODEL if workflow_type == "repricing_story" else DEFAULT_REASONING_MODEL
+
+
+def _multi_agent_kwargs(model_name: str) -> dict[str, int]:
+    if "multi-agent" in model_name:
+        return {"agent_count": 4}
+    return {}
 
 
 def _none_if_blank(value: str | None) -> str | None:

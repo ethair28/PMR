@@ -8,9 +8,11 @@ from pathlib import Path
 
 from pmr.models import (
     EvidenceItem,
+    PriceTracePoint,
     RelatedMarket,
     ResearchJob,
     ResearchMarketContext,
+    ResearchPriceContext,
     ResearchResult,
 )
 from pmr.research_engine import (
@@ -35,6 +37,7 @@ class ResearchPayloadTests(unittest.TestCase):
                     "story": {
                         "family_key": "trump-visit-china",
                         "family_label": "Trump Visit China",
+                        "workflow_type": "repricing_story",
                         "story_type_hint": "live_repricing",
                         "distance_from_extremes": 0.22,
                         "entered_extreme_zone": False,
@@ -72,9 +75,39 @@ class ResearchPayloadTests(unittest.TestCase):
                             "max_move_timestamp": "2026-03-24T09:00:00+00:00",
                         },
                         "features": {
+                            "window_open_probability": 0.62,
+                            "window_close_probability": 0.40,
+                            "window_high_probability": 0.68,
+                            "window_low_probability": 0.33,
                             "close_to_open_move": -0.22,
+                            "max_abs_move_6h": 0.14,
                             "max_abs_move_24h": 0.28,
+                            "largest_6h_move": -0.14,
+                            "largest_24h_move": -0.28,
                             "weekly_range": 0.35,
+                            "persistence_of_largest_move": 0.61,
+                            "jump_count_over_threshold": 2,
+                        },
+                        "price_context": {
+                            "interval_hours": 8,
+                            "largest_move_window_hours": 24,
+                            "largest_move_window_start": "2026-03-23T09:00:00+00:00",
+                            "largest_move_window_end": "2026-03-24T09:00:00+00:00",
+                            "surprise_reference_probability": None,
+                            "surprise_points": None,
+                            "surprise_label": None,
+                            "trace_points": [
+                                {
+                                    "observed_at": "2026-03-17T00:00:00+00:00",
+                                    "probability": 0.62,
+                                    "move_since_previous": None
+                                },
+                                {
+                                    "observed_at": "2026-03-17T08:00:00+00:00",
+                                    "probability": 0.58,
+                                    "move_since_previous": -0.04
+                                }
+                            ]
                         },
                         "notes": ["note 1"],
                     },
@@ -87,7 +120,9 @@ class ResearchPayloadTests(unittest.TestCase):
 
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].job_id, "job-1")
+        self.assertEqual(jobs[0].workflow_type, "repricing_story")
         self.assertEqual(jobs[0].primary_market.question, "Will Trump visit China by April 30?")
+        self.assertEqual(jobs[0].primary_market.price_context.interval_hours, 8)
         self.assertEqual(jobs[0].related_markets[0].market_id, "market-2")
 
     def test_dotenv_loader_trims_whitespace_and_preserves_existing_env(self) -> None:
@@ -189,14 +224,27 @@ class XaiSdkAdapterHelperTests(unittest.TestCase):
 
     def test_choose_best_model_name_prefers_latest_reasoning_candidate(self) -> None:
         available = {"grok-4-1-fast-reasoning-latest", "grok-4.20", "grok-3-mini"}
-        self.assertEqual(_choose_best_model_name(available), "grok-4.20")
+        self.assertEqual(_choose_best_model_name(available, workflow_type="resolution_story"), "grok-4.20")
 
     def test_choose_best_model_name_falls_back_to_default_when_unknown(self) -> None:
-        self.assertEqual(_choose_best_model_name({"grok-3-mini"}), "grok-4.20-reasoning-latest")
+        self.assertEqual(
+            _choose_best_model_name({"grok-3-mini"}, workflow_type="resolution_story"),
+            "grok-4.20-reasoning-latest",
+        )
 
     def test_choose_best_model_name_uses_any_grok4_reasoning_before_multi_agent(self) -> None:
         available = {"grok-4-fast-reasoning", "grok-4.20-multi-agent-latest"}
-        self.assertEqual(_choose_best_model_name(available), "grok-4-fast-reasoning")
+        self.assertEqual(
+            _choose_best_model_name(available, workflow_type="resolution_story"),
+            "grok-4-fast-reasoning",
+        )
+
+    def test_choose_best_model_name_prefers_multi_agent_for_repricing(self) -> None:
+        available = {"grok-4-fast-reasoning", "grok-4.20-multi-agent-latest"}
+        self.assertEqual(
+            _choose_best_model_name(available, workflow_type="repricing_story"),
+            "grok-4.20-multi-agent-latest",
+        )
 
 
 class ResearchStoreTests(unittest.TestCase):
@@ -281,8 +329,8 @@ class ResearchResultPayloadTests(unittest.TestCase):
         payload = build_research_results_payload(batch)
 
         self.assertEqual(payload["processed_jobs"], 1)
-        self.assertEqual(payload["results"][0]["job_id"], "job-1")
-        self.assertNotIn("brief_markdown", payload["results"][0])
+        self.assertEqual(payload["story_drafts"][0]["job_id"], "job-1")
+        self.assertNotIn("brief_markdown", payload["story_drafts"][0])
 
 
 def _build_job(job_id: str = "job-1") -> ResearchJob:
@@ -290,6 +338,7 @@ def _build_job(job_id: str = "job-1") -> ResearchJob:
         job_id=job_id,
         family_key="trump-visit-china",
         family_label="Trump Visit China",
+        workflow_type="repricing_story",
         story_type_hint="live_repricing",
         distance_from_extremes=0.22,
         entered_extreme_zone=False,
@@ -306,11 +355,38 @@ def _build_job(job_id: str = "job-1") -> ResearchJob:
             confidence_level="high",
             confidence_score=0.86,
             composite_score=8.47,
+            window_open_probability=0.62,
+            window_close_probability=0.40,
+            window_high_probability=0.68,
+            window_low_probability=0.33,
             close_to_open_move=-0.22,
+            max_abs_move_6h=0.14,
             max_abs_move_24h=0.28,
+            largest_6h_move=-0.14,
+            largest_24h_move=-0.28,
             weekly_range=0.35,
+            persistence_of_largest_move=0.61,
+            jump_count_over_threshold=2,
             max_move_timestamp=datetime(2026, 3, 24, 9, tzinfo=timezone.utc),
             category="politics",
+            price_context=ResearchPriceContext(
+                interval_hours=8,
+                trace_points=(
+                    PriceTracePoint(
+                        observed_at=datetime(2026, 3, 17, tzinfo=timezone.utc),
+                        probability=0.62,
+                        move_since_previous=None,
+                    ),
+                    PriceTracePoint(
+                        observed_at=datetime(2026, 3, 17, 8, tzinfo=timezone.utc),
+                        probability=0.58,
+                        move_since_previous=-0.04,
+                    ),
+                ),
+                largest_move_window_hours=24,
+                largest_move_window_start=datetime(2026, 3, 23, 9, tzinfo=timezone.utc),
+                largest_move_window_end=datetime(2026, 3, 24, 9, tzinfo=timezone.utc),
+            ),
             url="https://polymarket.com/event/trump-visit-china",
             notes=("Detector note",),
         ),
@@ -347,11 +423,20 @@ def _build_result(job: ResearchJob, *, cache_key: str, completed_at: datetime) -
         cache_key=cache_key,
         provider="test",
         prompt_version="v1",
+        model_name="heuristic",
+        workflow_type=job.workflow_type,
         status="completed",
         explanation_class="plausible",
         confidence=0.61,
         most_plausible_explanation="Likely driven by diplomatic signaling and new chatter around a possible visit.",
         why_market_moved=job.why_flagged,
+        price_action_summary="The market sold off sharply over the week after a concentrated 24h move.",
+        surprise_assessment="This is a repricing story rather than a resolved outcome.",
+        main_narrative="Traders appear to have downgraded the odds after the strongest signals failed to materialize.",
+        alternative_explanations=("The move may also reflect fading rumor momentum.",),
+        note_to_editor="Overlap with broader US-China diplomatic narratives.",
+        draft_headline="Trump Visit China: Odds Slide as Narrative Weakens",
+        draft_markdown="# Trump Visit China: Odds Slide as Narrative Weakens",
         key_evidence=(_build_evidence(url="https://example.com/1"),),
         contradictory_evidence=(),
         open_questions=("Was there a direct leak or only rumor-driven speculation?",),

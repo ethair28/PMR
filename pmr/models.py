@@ -8,6 +8,7 @@ ExplanationType = Literal["clear", "plausible", "speculative"]
 HistoryMode = Literal["full_history", "short_history", "insufficient_data"]
 ConfidenceLevel = Literal["high", "medium", "low"]
 StoryTypeHint = Literal["live_repricing", "resolved_surprise", "late_stage_resolution"]
+StoryWorkflowType = Literal["resolution_story", "repricing_story"]
 EditorialPriority = Literal["high", "medium", "low"]
 EvidenceSourceType = Literal["x_post", "web_article", "news_article"]
 EvidenceStance = Literal["supporting", "contradictory", "contextual"]
@@ -140,6 +141,29 @@ class RelatedMarket:
 
 
 @dataclass(frozen=True, slots=True)
+class PriceTracePoint:
+    """A compact price observation used by the story-development stage."""
+
+    observed_at: datetime
+    probability: float
+    move_since_previous: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchPriceContext:
+    """A concise price-action packet for one research/story job."""
+
+    interval_hours: int
+    trace_points: tuple[PriceTracePoint, ...]
+    largest_move_window_hours: int
+    largest_move_window_start: datetime | None
+    largest_move_window_end: datetime | None
+    surprise_reference_probability: float | None = None
+    surprise_points: float | None = None
+    surprise_label: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ResearchMarketContext:
     """Typed primary-market context for a research job."""
 
@@ -151,11 +175,21 @@ class ResearchMarketContext:
     confidence_level: ConfidenceLevel
     confidence_score: float
     composite_score: float
+    window_open_probability: float
+    window_close_probability: float
+    window_high_probability: float
+    window_low_probability: float
     close_to_open_move: float
+    max_abs_move_6h: float
     max_abs_move_24h: float
+    largest_6h_move: float
+    largest_24h_move: float
     weekly_range: float
+    persistence_of_largest_move: float
+    jump_count_over_threshold: int
     max_move_timestamp: datetime | None
     category: str
+    price_context: ResearchPriceContext
     slug: str | None = None
     url: str | None = None
     description: str | None = None
@@ -174,6 +208,7 @@ class ResearchJob:
     job_id: str
     family_key: str
     family_label: str
+    workflow_type: StoryWorkflowType
     story_type_hint: StoryTypeHint
     distance_from_extremes: float
     entered_extreme_zone: bool
@@ -217,17 +252,26 @@ class EvidenceItem:
 
 @dataclass(frozen=True, slots=True)
 class ResearchResult:
-    """Structured explanation produced by the research layer."""
+    """Structured story-development output produced by the research layer."""
 
     job_id: str
     cache_key: str
     provider: str
     prompt_version: str
+    model_name: str
+    workflow_type: StoryWorkflowType
     status: ResearchStatus
     explanation_class: ExplanationType | None
     confidence: float
     most_plausible_explanation: str
     why_market_moved: str
+    price_action_summary: str
+    surprise_assessment: str
+    main_narrative: str
+    alternative_explanations: tuple[str, ...]
+    note_to_editor: str
+    draft_headline: str
+    draft_markdown: str
     key_evidence: tuple[EvidenceItem, ...]
     contradictory_evidence: tuple[EvidenceItem, ...]
     open_questions: tuple[str, ...]

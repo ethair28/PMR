@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 from pmr.config import MonitoringConfig
 from pmr.models import (
     EvidenceItem,
+    PriceTracePoint,
     RelatedMarket,
     RepricingEvent,
     ResearchBatchResult,
     ResearchJob,
     ResearchMarketContext,
+    ResearchPriceContext,
     ResearchResult,
+    StoryWorkflowType,
 )
 
 
@@ -45,6 +48,8 @@ def build_research_input_payload(
 def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
     """Serialize one detected anomaly into the shape a research agent needs."""
 
+    workflow_type = _workflow_type_from_story_hint(event.story_type_hint)
+    price_context = _build_price_context(event)
     return {
         "market": {
             "market_id": event.market.market_id,
@@ -62,6 +67,7 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
         "story": {
             "family_key": event.story_group_key,
             "family_label": event.story_group_label,
+            "workflow_type": workflow_type,
             "story_type_hint": event.story_type_hint,
             "distance_from_extremes": event.distance_from_extremes,
             "entered_extreme_zone": event.entered_extreme_zone,
@@ -93,6 +99,7 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
             "persistence_of_largest_move": event.persistence_of_largest_move,
             "jump_count_over_threshold": event.jump_count_over_threshold,
         },
+        "price_context": serialize_price_context(price_context),
         "baseline_stats": {
             "usable_history_days": event.baseline_stats.usable_history_days,
             "snapshot_count": event.baseline_stats.snapshot_count,
@@ -121,11 +128,13 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
 def serialize_research_job(event: RepricingEvent) -> dict[str, Any]:
     """Serialize one anomaly into a story-oriented research brief."""
 
+    workflow_type = _workflow_type_from_story_hint(event.story_type_hint)
     return {
         "job_id": event.story_group_key,
         "story": {
             "family_key": event.story_group_key,
             "family_label": event.story_group_label,
+            "workflow_type": workflow_type,
             "story_type_hint": event.story_type_hint,
             "distance_from_extremes": event.distance_from_extremes,
             "entered_extreme_zone": event.entered_extreme_zone,
@@ -207,7 +216,7 @@ def load_research_jobs_from_payload(payload: dict[str, Any]) -> tuple[ResearchJo
 
 
 def build_research_results_payload(batch: ResearchBatchResult) -> dict[str, Any]:
-    """Serialize a batch of research results for storage or downstream tooling."""
+    """Serialize a batch of story-development outputs for storage or downstream tooling."""
 
     return {
         "generated_at": batch.generated_at.isoformat(),
@@ -216,23 +225,32 @@ def build_research_results_payload(batch: ResearchBatchResult) -> dict[str, Any]
         "processed_jobs": batch.processed_jobs,
         "cached_jobs": batch.cached_jobs,
         "failed_jobs": batch.failed_jobs,
-        "results": [serialize_research_result(result) for result in batch.results],
+        "story_drafts": [serialize_research_result(result) for result in batch.results],
     }
 
 
 def serialize_research_result(result: ResearchResult) -> dict[str, Any]:
-    """Serialize one structured research result."""
+    """Serialize one structured story-development output."""
 
     return {
         "job_id": result.job_id,
         "cache_key": result.cache_key,
         "provider": result.provider,
         "prompt_version": result.prompt_version,
+        "model_name": result.model_name,
+        "workflow_type": result.workflow_type,
         "status": result.status,
         "explanation_class": result.explanation_class,
         "confidence": result.confidence,
         "most_plausible_explanation": result.most_plausible_explanation,
         "why_market_moved": result.why_market_moved,
+        "price_action_summary": result.price_action_summary,
+        "surprise_assessment": result.surprise_assessment,
+        "main_narrative": result.main_narrative,
+        "alternative_explanations": list(result.alternative_explanations),
+        "note_to_editor": result.note_to_editor,
+        "draft_headline": result.draft_headline,
+        "draft_markdown": result.draft_markdown,
         "key_evidence": [serialize_evidence_item(item) for item in result.key_evidence],
         "contradictory_evidence": [serialize_evidence_item(item) for item in result.contradictory_evidence],
         "open_questions": list(result.open_questions),
@@ -260,6 +278,33 @@ def serialize_evidence_item(item: EvidenceItem) -> dict[str, Any]:
     }
 
 
+def serialize_price_context(context: ResearchPriceContext) -> dict[str, Any]:
+    """Serialize the compact weekly price context passed into story development."""
+
+    return {
+        "interval_hours": context.interval_hours,
+        "largest_move_window_hours": context.largest_move_window_hours,
+        "largest_move_window_start": (
+            context.largest_move_window_start.isoformat() if context.largest_move_window_start else None
+        ),
+        "largest_move_window_end": (
+            context.largest_move_window_end.isoformat() if context.largest_move_window_end else None
+        ),
+        "surprise_reference_probability": context.surprise_reference_probability,
+        "surprise_points": context.surprise_points,
+        "surprise_label": context.surprise_label,
+        "trace_points": [serialize_price_trace_point(item) for item in context.trace_points],
+    }
+
+
+def serialize_price_trace_point(item: PriceTracePoint) -> dict[str, Any]:
+    return {
+        "observed_at": item.observed_at.isoformat(),
+        "probability": item.probability,
+        "move_since_previous": item.move_since_previous,
+    }
+
+
 def _parse_research_job(payload: dict[str, Any]) -> ResearchJob:
     story = payload["story"]
     investigation = payload["investigation"]
@@ -275,6 +320,7 @@ def _parse_research_job(payload: dict[str, Any]) -> ResearchJob:
         job_id=str(payload["job_id"]),
         family_key=str(story["family_key"]),
         family_label=str(story["family_label"]),
+        workflow_type=story.get("workflow_type", _workflow_type_from_story_hint(story["story_type_hint"])),
         story_type_hint=story["story_type_hint"],
         distance_from_extremes=float(story["distance_from_extremes"]),
         entered_extreme_zone=bool(story["entered_extreme_zone"]),
@@ -291,6 +337,7 @@ def _parse_primary_market(payload: dict[str, Any]) -> ResearchMarketContext:
     market = payload["market"]
     detector = payload["detector"]
     features = payload["features"]
+    price_context = _parse_price_context(payload.get("price_context", {}), payload)
     return ResearchMarketContext(
         market_id=str(market["market_id"]),
         question=str(market["question"]),
@@ -300,15 +347,25 @@ def _parse_primary_market(payload: dict[str, Any]) -> ResearchMarketContext:
         confidence_level=detector["confidence_level"],
         confidence_score=float(detector["confidence_score"]),
         composite_score=float(detector["composite_score"]),
+        window_open_probability=float(features.get("window_open_probability", 0.0)),
+        window_close_probability=float(features.get("window_close_probability", 0.0)),
+        window_high_probability=float(features.get("window_high_probability", 0.0)),
+        window_low_probability=float(features.get("window_low_probability", 0.0)),
         close_to_open_move=float(features["close_to_open_move"]),
+        max_abs_move_6h=float(features.get("max_abs_move_6h", 0.0)),
         max_abs_move_24h=float(features["max_abs_move_24h"]),
+        largest_6h_move=float(features.get("largest_6h_move", 0.0)),
+        largest_24h_move=float(features.get("largest_24h_move", 0.0)),
         weekly_range=float(features["weekly_range"]),
+        persistence_of_largest_move=float(features.get("persistence_of_largest_move", 0.0)),
+        jump_count_over_threshold=int(features.get("jump_count_over_threshold", 0)),
         max_move_timestamp=(
             datetime.fromisoformat(detector["max_move_timestamp"])
             if detector.get("max_move_timestamp")
             else None
         ),
         category=str(market["category"]),
+        price_context=price_context,
         slug=market.get("slug"),
         url=market.get("url"),
         description=market.get("description"),
@@ -319,3 +376,142 @@ def _parse_primary_market(payload: dict[str, Any]) -> ResearchMarketContext:
         event_title=market.get("event_title"),
         notes=tuple(str(note) for note in payload.get("notes", ())),
     )
+
+
+def _parse_price_context(raw: dict[str, Any], market_payload: dict[str, Any]) -> ResearchPriceContext:
+    trace_points = tuple(
+        PriceTracePoint(
+            observed_at=datetime.fromisoformat(item["observed_at"]),
+            probability=float(item["probability"]),
+            move_since_previous=(
+                float(item["move_since_previous"]) if item.get("move_since_previous") is not None else None
+            ),
+        )
+        for item in raw.get("trace_points", ())
+    )
+    if not raw:
+        detector = market_payload["detector"]
+        return ResearchPriceContext(
+            interval_hours=8,
+            trace_points=trace_points,
+            largest_move_window_hours=24,
+            largest_move_window_start=(
+                datetime.fromisoformat(detector["max_move_timestamp"]) if detector.get("max_move_timestamp") else None
+            ),
+            largest_move_window_end=(
+                datetime.fromisoformat(detector["max_move_timestamp"]) if detector.get("max_move_timestamp") else None
+            ),
+        )
+    return ResearchPriceContext(
+        interval_hours=int(raw.get("interval_hours", 8)),
+        trace_points=trace_points,
+        largest_move_window_hours=int(raw.get("largest_move_window_hours", 24)),
+        largest_move_window_start=(
+            datetime.fromisoformat(raw["largest_move_window_start"])
+            if raw.get("largest_move_window_start")
+            else None
+        ),
+        largest_move_window_end=(
+            datetime.fromisoformat(raw["largest_move_window_end"])
+            if raw.get("largest_move_window_end")
+            else None
+        ),
+        surprise_reference_probability=(
+            float(raw["surprise_reference_probability"])
+            if raw.get("surprise_reference_probability") is not None
+            else None
+        ),
+        surprise_points=(
+            float(raw["surprise_points"]) if raw.get("surprise_points") is not None else None
+        ),
+        surprise_label=raw.get("surprise_label"),
+    )
+
+
+def _workflow_type_from_story_hint(story_type_hint: str) -> StoryWorkflowType:
+    if story_type_hint == "live_repricing":
+        return "repricing_story"
+    return "resolution_story"
+
+
+def _build_price_context(event: RepricingEvent) -> ResearchPriceContext:
+    trace_points = _sample_trace_points(
+        snapshots=event.series.snapshots,
+        start=event.detection_window_start,
+        end=event.detection_window_end,
+        interval_hours=8,
+    )
+    largest_window_hours = 24 if event.max_abs_move_24h >= event.max_abs_move_6h else 6
+    largest_move_end = event.max_move_timestamp
+    largest_move_start = (
+        largest_move_end - timedelta(hours=largest_window_hours) if largest_move_end else None
+    )
+    surprise_reference_probability = None
+    surprise_points = None
+    surprise_label = None
+    workflow_type = _workflow_type_from_story_hint(event.story_type_hint)
+    if workflow_type == "resolution_story":
+        surprise_reference_probability = event.window_open_probability
+        surprise_points = _resolution_surprise_points(event)
+        surprise_label = _surprise_label(surprise_points)
+    return ResearchPriceContext(
+        interval_hours=8,
+        trace_points=trace_points,
+        largest_move_window_hours=largest_window_hours,
+        largest_move_window_start=largest_move_start,
+        largest_move_window_end=largest_move_end,
+        surprise_reference_probability=surprise_reference_probability,
+        surprise_points=surprise_points,
+        surprise_label=surprise_label,
+    )
+
+
+def _sample_trace_points(
+    *,
+    snapshots: Sequence[Any],
+    start: datetime,
+    end: datetime,
+    interval_hours: int,
+) -> tuple[PriceTracePoint, ...]:
+    selected = []
+    step_seconds = interval_hours * 3600
+    latest_probability = None
+    cursor = 0
+    ordered = tuple(sorted(snapshots, key=lambda item: item.observed_at))
+    total_points = max(1, int(((end - start).total_seconds() // step_seconds)) + 1)
+    for index in range(total_points + 1):
+        target = start + timedelta(seconds=min(index * step_seconds, (end - start).total_seconds()))
+        while cursor < len(ordered) and ordered[cursor].observed_at <= target:
+            latest_probability = ordered[cursor].probability
+            cursor += 1
+        if latest_probability is None:
+            continue
+        move_since_previous = (
+            latest_probability - selected[-1].probability if selected else None
+        )
+        selected.append(
+            PriceTracePoint(
+                observed_at=target,
+                probability=latest_probability,
+                move_since_previous=move_since_previous,
+            )
+        )
+    return tuple(selected)
+
+
+def _resolution_surprise_points(event: RepricingEvent) -> float:
+    resolved_up = event.window_close_probability >= 0.5
+    reference = event.window_open_probability
+    if resolved_up:
+        return max(0.0, (1.0 - reference) * 100.0)
+    return max(0.0, reference * 100.0)
+
+
+def _surprise_label(points: float | None) -> str | None:
+    if points is None:
+        return None
+    if points >= 45.0:
+        return "high_surprise"
+    if points >= 20.0:
+        return "moderate_surprise"
+    return "low_surprise"
