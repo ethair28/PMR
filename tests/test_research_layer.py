@@ -42,6 +42,10 @@ class ResearchPayloadTests(unittest.TestCase):
                         "distance_from_extremes": 0.22,
                         "entered_extreme_zone": False,
                         "editorial_priority_hint": "high",
+                        "story_role_hint": "standalone",
+                        "overlap_group_key": None,
+                        "overlap_summary": None,
+                        "suggested_merge_with": [],
                     },
                     "investigation": {
                         "question": "What explains the repricing?",
@@ -121,6 +125,7 @@ class ResearchPayloadTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].job_id, "job-1")
         self.assertEqual(jobs[0].workflow_type, "repricing_story")
+        self.assertEqual(jobs[0].story_role_hint, "standalone")
         self.assertEqual(jobs[0].primary_market.question, "Will Trump visit China by April 30?")
         self.assertEqual(jobs[0].primary_market.price_context.interval_hours, 8)
         self.assertEqual(jobs[0].related_markets[0].market_id, "market-2")
@@ -177,6 +182,33 @@ class ResearchEngineTests(unittest.TestCase):
 
         self.assertEqual(len(ranked), 1)
         self.assertEqual(ranked[0].title_or_text, "Higher score")
+
+    def test_rank_evidence_penalizes_wikipedia_and_market_commentary(self) -> None:
+        job = _build_job()
+        strong_news = _build_evidence(
+            url="https://www.reuters.com/world/example",
+            title="Reuters report",
+            relevance_score=0.7,
+            temporal_score=0.7,
+        )
+        wikipedia = _build_evidence(
+            url="https://en.wikipedia.org/wiki/Example",
+            title="Wikipedia page",
+            relevance_score=0.9,
+            temporal_score=0.9,
+        )
+        market_commentary = _build_evidence(
+            url="https://x.com/AgentOnChain/status/1",
+            title="Polymarket odds moved on this story",
+            relevance_score=0.9,
+            temporal_score=0.9,
+            source_type="x_post",
+            author="AgentOnChain",
+        )
+
+        ranked = rank_evidence_for_job(job=job, evidence=(wikipedia, market_commentary, strong_news), max_items=3)
+
+        self.assertEqual(ranked[0].url, "https://www.reuters.com/world/example")
 
     def test_heuristic_synthesizer_marks_insufficient_when_no_evidence(self) -> None:
         job = _build_job()
@@ -343,6 +375,7 @@ def _build_job(job_id: str = "job-1") -> ResearchJob:
         distance_from_extremes=0.22,
         entered_extreme_zone=False,
         editorial_priority_hint="high",
+        story_role_hint="standalone",
         investigation_question="What most plausibly explains the repricing?",
         why_flagged="Flagged because the market moved 28 points in 24 hours.",
         focus_points=("Search X first", "Look near the move timestamp"),
@@ -390,6 +423,9 @@ def _build_job(job_id: str = "job-1") -> ResearchJob:
             url="https://polymarket.com/event/trump-visit-china",
             notes=("Detector note",),
         ),
+        overlap_group_key=None,
+        overlap_summary=None,
+        suggested_merge_with=(),
         related_markets=(RelatedMarket(market_id="market-2", question="Will Trump visit China by March 31?"),),
     )
 
@@ -401,12 +437,14 @@ def _build_evidence(
     temporal_score: float = 0.8,
     title: str = "Evidence item",
     stance: str = "supporting",
+    source_type: str = "web_article",
+    author: str = "Reporter",
 ) -> EvidenceItem:
     return EvidenceItem(
-        source_type="web_article",
+        source_type=source_type,
         url=url,
         title_or_text=title,
-        author_or_publication="Reporter",
+        author_or_publication=author,
         published_at=datetime(2026, 3, 24, 8, tzinfo=timezone.utc),
         collected_at=datetime(2026, 3, 25, tzinfo=timezone.utc),
         relevance_score=relevance_score,
@@ -425,6 +463,7 @@ def _build_result(job: ResearchJob, *, cache_key: str, completed_at: datetime) -
         prompt_version="v1",
         model_name="heuristic",
         workflow_type=job.workflow_type,
+        story_role_hint=job.story_role_hint,
         status="completed",
         explanation_class="plausible",
         confidence=0.61,
@@ -437,6 +476,9 @@ def _build_result(job: ResearchJob, *, cache_key: str, completed_at: datetime) -
         note_to_editor="Overlap with broader US-China diplomatic narratives.",
         draft_headline="Trump Visit China: Odds Slide as Narrative Weakens",
         draft_markdown="# Trump Visit China: Odds Slide as Narrative Weakens",
+        overlap_group_key=job.overlap_group_key,
+        overlap_summary=job.overlap_summary,
+        suggested_merge_with=job.suggested_merge_with,
         key_evidence=(_build_evidence(url="https://example.com/1"),),
         contradictory_evidence=(),
         open_questions=("Was there a direct leak or only rumor-driven speculation?",),

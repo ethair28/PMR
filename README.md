@@ -19,6 +19,27 @@ PMR is not trying to compete with a general news feed. The product thesis is nar
 - real price moves tell us where market perception changed,
 - and AI is used to explain why that change happened.
 
+The core promise is:
+
+- not "everything important that happened,"
+- but "the small set of developments that caused traders with money at risk to materially change their minds."
+
+PMR starts from changing probabilities, not from headlines. The point is to identify which developments actually changed perceived odds, then explain those developments in a way that is concise, evidence-backed, and editorially useful.
+
+Another way to say this:
+
+- PMR is a report about changes in belief, not a report about the entire news cycle.
+- The product uses market repricing to decide what deserves attention.
+- It then uses AI to investigate what likely caused that repricing and how much confidence we should have in the explanation.
+
+The user value is straightforward:
+
+- readers get a small, high-signal set of market moves that actually mattered,
+- they get a probabilistic view of surprise and significance rather than headline intensity,
+- and they get help interpreting messy, uncertain stories where the market moved before there was a single clean consensus narrative.
+
+## Story Types
+
 The report is designed around two distinct story classes:
 
 1. Resolution stories
@@ -26,15 +47,62 @@ The report is designed around two distinct story classes:
 - These are markets whose move is driven by event-concluding news.
 - The core value is not discovering hidden news. It is quantifying surprise.
 - A good PMR resolution story should answer: what happened, how decisively did it resolve the market, and how wrong or right was the market beforehand?
+- The user value is expectation calibration: even when the underlying news is already widely reported, PMR can still show whether the outcome was obvious, contested, or a genuine surprise to the market.
 
 2. Repricing stories
 
 - These are the more important long-run product category.
 - They reflect a meaningful shift in perceived probability without a clean resolved outcome.
 - They are often driven by rumors, negotiation signals, sentiment shifts, leaks, social-media chatter, or several weak signals arriving together.
-- A good PMR repricing story should answer: what most plausibly changed market perception, how confident are we, and what remains uncertain?
+- A good PMR repricing story should answer: what most plausibly changed market perception, what type of information did the work, how confident are we, and what remains uncertain?
+- The user value is early interpretation: PMR can surface shifts in belief before there is a single clean headline, then synthesize the messy mix of signals that likely drove the repricing.
+
+## Why Repricing Stories Matter Most
+
+Repricing stories are the bread and butter of the report.
+
+Why:
+
+- mainstream news is already relatively good at covering clear resolved events,
+- but it is much worse at quantifying changes in perceived probability,
+- and it is especially weak at explaining messy, ambiguous belief shifts driven by many partial signals.
+
+That is where PMR has the strongest edge: using a market move as the relevance filter, then using AI to build the best explanation for why traders seem to be updating.
+
+This is the product's main differentiator. A strong repricing story can be valuable even when:
+
+- the evidence is incomplete,
+- the reasons are distributed across many weak signals,
+- the story is still unresolved,
+- and mainstream coverage has not yet pulled those signals into one clear narrative.
 
 This is why PMR starts from markets rather than headlines. The system is meant to cut through sensationalism and noise by asking a narrower question: where did traders with money at risk materially change their minds?
+
+## What PMR Is Not Trying To Do
+
+PMR is intentionally narrow. It is not trying to:
+
+- be a general-purpose news aggregator,
+- summarize every important world event,
+- cover public-market proxy contracts like gold, oil, or Bitcoin price ladders,
+- publish directly from raw detector output without an editorial layer,
+- or claim that every market move has a single clean causal explanation.
+
+Instead, PMR is trying to do one thing well:
+
+- identify the small set of prediction-market moves worth attention,
+- explain what most likely caused those moves,
+- distinguish between clear surprise, plausible explanation, and unclear signal,
+- and hand strong material to an editor/composer agent that applies explicit taste and quality guidelines before final publication.
+
+That means PMR is not trying to:
+
+- optimize for the largest possible number of stories,
+- track ordinary public-market instruments that already reprice in deep public markets,
+- pretend every interesting market move deserves publication,
+- or eliminate the need for an explicit editorial taste layer inside the system.
+
+The system is deliberately designed to automate the workflow end to end while still preserving editorial judgment as a first-class step inside the system itself.
 
 ## Current Scope
 
@@ -54,6 +122,7 @@ What is implemented now:
 - An optional detector-only Markdown report generator for debugging and tuning.
 - A research-input JSON exporter that now emits story-oriented jobs alongside the raw anomaly rows.
 - Per-story price-action packets, including 8-hour traces over the week, largest-move windows, and surprise metrics for resolution stories.
+- Soft overlap hints that flag which weekly candidates may belong in the same editor-level story cluster.
 - A separate Grok-backed story-development runner that consumes those jobs, routes resolution stories and repricing stories differently, caches normalized evidence in bounded SQLite storage, and writes structured story drafts JSON.
 - A sample-data runner so the pipeline works locally without external credentials.
 - An xAI SDK-backed story worker for X-first live research plus web corroboration.
@@ -247,6 +316,12 @@ PMR now assumes the Grok ecosystem for the story-development stage. The default 
 
 You can still override that routing with `PMR_XAI_MODEL` if you want to force one model for a debugging run.
 
+The story-development quality policy is intentionally asymmetric:
+
+- resolution stories should quantify surprise cleanly and tie it to decisive reporting
+- repricing stories should explain why odds moved, not just summarize the event
+- market-commentary posts and tertiary sources are weaker evidence than direct reporting, official statements, or clearly relevant local coverage
+
 The story-development cache is explicitly bounded:
 
 - only normalized evidence metadata plus short excerpts are stored
@@ -345,6 +420,12 @@ The downstream handoff now also includes a compact weekly price-action packet so
 - largest move window timing
 - window open / close / high / low probabilities
 - resolution surprise metrics when applicable
+
+It also includes soft overlap metadata for downstream editorial review:
+
+- `story_role_hint`: whether a candidate looks like the primary or secondary angle inside a broader cluster
+- `overlap_group_key`: a coarse editor-facing cluster key
+- `suggested_merge_with`: nearby weekly candidates that may belong in the same final writeup
 
 ## Architecture
 

@@ -54,6 +54,7 @@ class HeuristicResearchSynthesizer:
                 prompt_version=prompt_version,
                 model_name="heuristic",
                 workflow_type=job.workflow_type,
+                story_role_hint=job.story_role_hint,
                 status="insufficient_evidence",
                 explanation_class="speculative",
                 confidence=0.24,
@@ -72,6 +73,9 @@ class HeuristicResearchSynthesizer:
                     headline=job.family_label,
                     narrative="Evidence was too thin to support a publication-ready draft.",
                 ),
+                overlap_group_key=job.overlap_group_key,
+                overlap_summary=job.overlap_summary,
+                suggested_merge_with=job.suggested_merge_with,
                 key_evidence=(),
                 contradictory_evidence=(),
                 open_questions=(
@@ -132,6 +136,7 @@ class HeuristicResearchSynthesizer:
             prompt_version=prompt_version,
             model_name="heuristic",
             workflow_type=job.workflow_type,
+            story_role_hint=job.story_role_hint,
             status=status,
             explanation_class=explanation_class,
             confidence=confidence,
@@ -147,6 +152,9 @@ class HeuristicResearchSynthesizer:
             note_to_editor=note_to_editor,
             draft_headline=headline,
             draft_markdown=_build_fallback_draft(job, headline=headline, narrative=main_narrative),
+            overlap_group_key=job.overlap_group_key,
+            overlap_summary=job.overlap_summary,
+            suggested_merge_with=job.suggested_merge_with,
             key_evidence=top_support,
             contradictory_evidence=top_contradictory,
             open_questions=tuple(open_questions),
@@ -232,6 +240,7 @@ class ResearchEngine:
                 prompt_version=self.prompt_version,
                 model_name="unavailable",
                 workflow_type=job.workflow_type,
+                story_role_hint=job.story_role_hint,
                 status="failed",
                 explanation_class=None,
                 confidence=0.0,
@@ -244,6 +253,9 @@ class ResearchEngine:
                 note_to_editor="The story-development run failed before synthesis completed.",
                 draft_headline=job.family_label,
                 draft_markdown="",
+                overlap_group_key=job.overlap_group_key,
+                overlap_summary=job.overlap_summary,
+                suggested_merge_with=job.suggested_merge_with,
                 key_evidence=(),
                 contradictory_evidence=(),
                 open_questions=("The research run failed before completing synthesis.",),
@@ -332,7 +344,7 @@ def rank_evidence_for_job(
     evidence: Sequence[EvidenceItem],
     max_items: int,
 ) -> tuple[EvidenceItem, ...]:
-    """Dedupe and rank evidence using temporal proximity and source relevance."""
+    """Dedupe and rank evidence using temporal proximity, source quality, and workflow needs."""
 
     focus_timestamp = job.primary_market.max_move_timestamp or job.primary_market.detection_window_end
     deduped: dict[str, EvidenceItem] = {}
@@ -351,6 +363,19 @@ def rank_evidence_for_job(
         ),
         reverse=True,
     )
+    if job.workflow_type == "repricing_story":
+        contradictory = [item for item in ranked if item.stance == "contradictory"]
+        non_contradictory = [item for item in ranked if item.stance != "contradictory"]
+        if contradictory:
+            selected: list[EvidenceItem] = [non_contradictory[0]] if non_contradictory else []
+            selected.append(contradictory[0])
+            for item in ranked:
+                if item in selected:
+                    continue
+                selected.append(item)
+                if len(selected) >= max_items:
+                    break
+            return tuple(selected[:max_items])
     return tuple(ranked[:max_items])
 
 
@@ -375,7 +400,7 @@ def _normalize_evidence_item(item: EvidenceItem, focus_timestamp: datetime) -> E
 
 def _combined_evidence_score(item: EvidenceItem) -> float:
     stance_bonus = 0.05 if item.stance == "supporting" else 0.0
-    return item.relevance_score + item.temporal_proximity_score + stance_bonus
+    return item.relevance_score + item.temporal_proximity_score + stance_bonus + _source_quality_adjustment(item)
 
 
 def _temporal_proximity_score(observed_at: datetime, focus_timestamp: datetime) -> float:
@@ -385,6 +410,28 @@ def _temporal_proximity_score(observed_at: datetime, focus_timestamp: datetime) 
 
 def _clean_query(value: str) -> str:
     return " ".join(value.split())
+
+
+def _source_quality_adjustment(item: EvidenceItem) -> float:
+    url = item.url.lower()
+    title = item.title_or_text.lower()
+    author = (item.author_or_publication or "").lower()
+    adjustment = 0.0
+    if "wikipedia.org" in url:
+        adjustment -= 0.40
+    if item.source_type == "x_post":
+        adjustment -= 0.08
+        if any(token in author for token in _MARKET_COMMENTARY_HANDLES) or any(
+            token in title for token in _MARKET_COMMENTARY_TERMS
+        ):
+            adjustment -= 0.18
+        if any(token in author for token in _NEWSY_X_ACCOUNTS):
+            adjustment += 0.06
+    if any(domain in url for domain in _HIGH_SIGNAL_DOMAINS):
+        adjustment += 0.12
+    if "truthsocial.com" in url or "whitehouse.gov" in url:
+        adjustment += 0.18
+    return adjustment
 
 
 def _build_price_action_summary(job: ResearchJob) -> str:
@@ -430,3 +477,43 @@ def _build_fallback_draft(job: ResearchJob, *, headline: str, narrative: str) ->
             _build_surprise_assessment(job),
         )
     )
+
+
+_MARKET_COMMENTARY_TERMS = {
+    "polymarket",
+    "odds",
+    "volume",
+    "traders",
+    "cents",
+    "market",
+}
+
+_MARKET_COMMENTARY_HANDLES = {
+    "polynews",
+    "agentonchain",
+    "whalemovers",
+    "polyworm",
+    "0xzx",
+}
+
+_NEWSY_X_ACCOUNTS = {
+    "reuters",
+    "politico",
+    "france 24",
+    "euronews",
+    "news",
+    "company",
+}
+
+_HIGH_SIGNAL_DOMAINS = {
+    "reuters.com",
+    "bloomberg.com",
+    "politico.eu",
+    "apnews.com",
+    "upi.com",
+    "euronews.com",
+    "france24.com",
+    "aljazeera.com",
+    "news.un.org",
+    "whitehouse.gov",
+}

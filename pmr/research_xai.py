@@ -196,6 +196,7 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
             prompt_version=prompt_version,
             model_name=model_name,
             workflow_type=job.workflow_type,
+            story_role_hint=job.story_role_hint,
             status=parsed.status,
             explanation_class=parsed.explanation_class,
             confidence=_clamp_float(parsed.confidence, default=0.0),
@@ -208,6 +209,9 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
             note_to_editor=parsed.note_to_editor.strip(),
             draft_headline=parsed.draft_headline.strip(),
             draft_markdown=parsed.draft_markdown.strip(),
+            overlap_group_key=job.overlap_group_key,
+            overlap_summary=job.overlap_summary,
+            suggested_merge_with=job.suggested_merge_with,
             key_evidence=tuple(evidence[:5]),
             contradictory_evidence=tuple(item for item in evidence if item.stance == "contradictory")[:3],
             open_questions=tuple(item.strip() for item in parsed.open_questions if item.strip()),
@@ -221,6 +225,8 @@ SOURCE_SYSTEM_PROMPT = """You are a research retriever for a prediction-market s
 Use x_search first and web_search second. Gather evidence about why the market repriced near the supplied move window.
 
 Return only structured data matching the provided schema. Do not invent URLs, authors, or publication dates. If evidence is weak, return fewer items rather than guessing. Prefer evidence that is temporally close to the move timestamp and clearly relevant to the market question. Include at least one contradictory or cautionary item when the evidence is contested or incomplete.
+
+Prefer underlying reporting, official statements, and directly relevant local/news accounts over posts that merely comment on Polymarket odds or trading flow.
 """
 
 
@@ -229,6 +235,14 @@ SYNTHESIS_SYSTEM_PROMPT = """You are a prediction-market story developer.
 You will receive a market, a search plan, weekly price-action context, and normalized evidence items that already came from xAI search tools. Return only structured data matching the provided schema.
 
 If the story is a resolution story, quantify the surprise clearly. If it is a repricing story, focus on the best narrative for why market perception shifted without claiming false certainty. Always leave a note for the editor. If the evidence is weak or conflicting, use "insufficient_evidence" or "speculative" rather than overstating certainty.
+
+Draft requirements:
+- keep the tone concise, factual, and information-dense
+- lead with the trigger and the market move
+- for repricing stories, distinguish what happened from why traders changed their minds
+- for resolution stories, explicitly quantify the surprise
+- make note_to_editor short and actionable
+- if overlap metadata suggests a merge, mention that directly in note_to_editor
 """
 
 
@@ -238,6 +252,7 @@ def _build_source_prompt(job: ResearchJob, query_plan: ResearchQueryPlan, *, max
         f"Story: {job.family_label}\n"
         f"Workflow type: {job.workflow_type}\n"
         f"Story type hint: {job.story_type_hint}\n"
+        f"Story role hint: {job.story_role_hint}\n"
         f"Editorial priority hint: {job.editorial_priority_hint}\n"
         f"Investigation question: {job.investigation_question}\n"
         f"Why flagged: {job.why_flagged}\n"
@@ -251,6 +266,7 @@ def _build_source_prompt(job: ResearchJob, query_plan: ResearchQueryPlan, *, max
         f"{job.primary_market.max_move_timestamp.isoformat() if job.primary_market.max_move_timestamp else 'n/a'}\n"
         f"Weekly price trace (8h): {_format_price_trace(job)}\n"
         f"Surprise context: {_format_surprise_context(job)}\n"
+        f"Overlap context: {_format_overlap_context(job)}\n"
         f"Focus points: {', '.join(query_plan.focus_points) if query_plan.focus_points else 'none'}\n"
         f"X queries: {', '.join(query_plan.x_queries)}\n"
         f"Web queries: {', '.join(query_plan.web_queries)}\n"
@@ -270,12 +286,14 @@ def _build_synthesis_prompt(
         f"Story: {job.family_label}",
         f"Workflow type: {job.workflow_type}",
         f"Story type hint: {job.story_type_hint}",
+        f"Story role hint: {job.story_role_hint}",
         f"Investigation question: {job.investigation_question}",
         f"Why flagged: {job.why_flagged}",
         f"Primary market: {job.primary_market.question}",
         f"Detection window: {query_plan.time_window_start.isoformat()} to {query_plan.time_window_end.isoformat()}",
         f"Focus timestamp: {query_plan.focus_timestamp.isoformat() if query_plan.focus_timestamp else 'n/a'}",
         f"Price action summary packet: {_format_price_context(job)}",
+        f"Overlap context: {_format_overlap_context(job)}",
         "Evidence:",
     ]
     for index, item in enumerate(evidence, start=1):
@@ -334,6 +352,16 @@ def _format_price_context(job: ResearchJob) -> str:
         f"largest_window={context.largest_move_window_hours}h "
         f"from={context.largest_move_window_start.isoformat() if context.largest_move_window_start else 'n/a'} "
         f"to={context.largest_move_window_end.isoformat() if context.largest_move_window_end else 'n/a'}"
+    )
+
+
+def _format_overlap_context(job: ResearchJob) -> str:
+    if not job.overlap_group_key:
+        return "standalone"
+    return (
+        f"group={job.overlap_group_key} role={job.story_role_hint} "
+        f"merge_with={', '.join(job.suggested_merge_with) if job.suggested_merge_with else 'none'} "
+        f"summary={job.overlap_summary or 'n/a'}"
     )
 
 

@@ -9,6 +9,7 @@ HistoryMode = Literal["full_history", "short_history", "insufficient_data"]
 ConfidenceLevel = Literal["high", "medium", "low"]
 StoryTypeHint = Literal["live_repricing", "resolved_surprise", "late_stage_resolution"]
 StoryWorkflowType = Literal["resolution_story", "repricing_story"]
+StoryRoleHint = Literal["primary", "secondary", "standalone"]
 EditorialPriority = Literal["high", "medium", "low"]
 EvidenceSourceType = Literal["x_post", "web_article", "news_article"]
 EvidenceStance = Literal["supporting", "contradictory", "contextual"]
@@ -213,10 +214,14 @@ class ResearchJob:
     distance_from_extremes: float
     entered_extreme_zone: bool
     editorial_priority_hint: EditorialPriority
+    story_role_hint: StoryRoleHint
     investigation_question: str
     why_flagged: str
     focus_points: tuple[str, ...]
     primary_market: ResearchMarketContext
+    overlap_group_key: str | None = None
+    overlap_summary: str | None = None
+    suggested_merge_with: tuple[str, ...] = ()
     related_markets: tuple[RelatedMarket, ...] = ()
 
 
@@ -260,6 +265,7 @@ class ResearchResult:
     prompt_version: str
     model_name: str
     workflow_type: StoryWorkflowType
+    story_role_hint: StoryRoleHint
     status: ResearchStatus
     explanation_class: ExplanationType | None
     confidence: float
@@ -272,6 +278,9 @@ class ResearchResult:
     note_to_editor: str
     draft_headline: str
     draft_markdown: str
+    overlap_group_key: str | None
+    overlap_summary: str | None
+    suggested_merge_with: tuple[str, ...]
     key_evidence: tuple[EvidenceItem, ...]
     contradictory_evidence: tuple[EvidenceItem, ...]
     open_questions: tuple[str, ...]

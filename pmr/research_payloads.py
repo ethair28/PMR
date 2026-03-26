@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import re
 from typing import Any, Sequence
 
 from pmr.config import MonitoringConfig
@@ -16,6 +17,7 @@ from pmr.models import (
     ResearchMarketContext,
     ResearchPriceContext,
     ResearchResult,
+    StoryRoleHint,
     StoryWorkflowType,
 )
 
@@ -30,6 +32,7 @@ def build_research_input_payload(
     """Build JSON-serializable anomaly payloads for a downstream research agent."""
 
     stamp = generated_at or datetime.now(timezone.utc)
+    overlap_assignments = _build_overlap_assignments(events)
     return {
         "generated_at": stamp.isoformat(),
         "source": {
@@ -40,16 +43,25 @@ def build_research_input_payload(
             "min_abs_move_24h": config.min_abs_move_24h,
             "min_weekly_range": config.min_weekly_range,
         },
-        "research_jobs": [serialize_research_job(event) for event in events],
-        "anomalies": [serialize_event_for_research(event) for event in events],
+        "research_jobs": [
+            serialize_research_job(event, overlap_assignments=overlap_assignments) for event in events
+        ],
+        "anomalies": [
+            serialize_event_for_research(event, overlap_assignments=overlap_assignments) for event in events
+        ],
     }
 
 
-def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
+def serialize_event_for_research(
+    event: RepricingEvent,
+    *,
+    overlap_assignments: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Serialize one detected anomaly into the shape a research agent needs."""
 
     workflow_type = _workflow_type_from_story_hint(event.story_type_hint)
     price_context = _build_price_context(event)
+    overlap = (overlap_assignments or {}).get(event.story_group_key, _default_overlap_assignment())
     return {
         "market": {
             "market_id": event.market.market_id,
@@ -71,6 +83,10 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
             "story_type_hint": event.story_type_hint,
             "distance_from_extremes": event.distance_from_extremes,
             "entered_extreme_zone": event.entered_extreme_zone,
+            "story_role_hint": overlap["story_role_hint"],
+            "overlap_group_key": overlap["overlap_group_key"],
+            "overlap_summary": overlap["overlap_summary"],
+            "suggested_merge_with": list(overlap["suggested_merge_with"]),
             "related_market_ids": list(event.related_market_ids),
             "related_market_questions": list(event.related_market_questions),
         },
@@ -125,10 +141,15 @@ def serialize_event_for_research(event: RepricingEvent) -> dict[str, Any]:
     }
 
 
-def serialize_research_job(event: RepricingEvent) -> dict[str, Any]:
+def serialize_research_job(
+    event: RepricingEvent,
+    *,
+    overlap_assignments: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Serialize one anomaly into a story-oriented research brief."""
 
     workflow_type = _workflow_type_from_story_hint(event.story_type_hint)
+    overlap = (overlap_assignments or {}).get(event.story_group_key, _default_overlap_assignment())
     return {
         "job_id": event.story_group_key,
         "story": {
@@ -139,13 +160,17 @@ def serialize_research_job(event: RepricingEvent) -> dict[str, Any]:
             "distance_from_extremes": event.distance_from_extremes,
             "entered_extreme_zone": event.entered_extreme_zone,
             "editorial_priority_hint": _editorial_priority_hint(event),
+            "story_role_hint": overlap["story_role_hint"],
+            "overlap_group_key": overlap["overlap_group_key"],
+            "overlap_summary": overlap["overlap_summary"],
+            "suggested_merge_with": list(overlap["suggested_merge_with"]),
         },
         "investigation": {
             "question": _build_investigation_question(event),
             "why_flagged": _build_why_flagged(event),
-            "focus_points": _build_focus_points(event),
+            "focus_points": _build_focus_points(event, overlap=overlap),
         },
-        "primary_market": serialize_event_for_research(event),
+        "primary_market": serialize_event_for_research(event, overlap_assignments=overlap_assignments),
         "related_markets": [
             {"market_id": market_id, "question": question}
             for market_id, question in zip(event.related_market_ids, event.related_market_questions)
@@ -170,12 +195,19 @@ def _build_why_flagged(event: RepricingEvent) -> str:
     )
 
 
-def _build_focus_points(event: RepricingEvent) -> list[str]:
+def _build_focus_points(
+    event: RepricingEvent,
+    *,
+    overlap: dict[str, Any] | None = None,
+) -> list[str]:
     points = [
         "Prioritize evidence near the largest move timestamp and compare clear news against rumor-driven repricing.",
         "Decide whether the move reflects a genuine surprise, a plausible but uncertain explanation, or mostly speculative chatter.",
     ]
     if event.story_type_hint == "live_repricing":
+        points.append(
+            "Explain what changed market perception, not just what happened: separate hard news, rumor, negotiation signals, social commentary, and sentiment when multiple forces are in play."
+        )
         points.append(
             "Look for incremental developments, negotiations, leaks, or commentary that shifted odds without fully resolving the market."
         )
@@ -190,6 +222,10 @@ def _build_focus_points(event: RepricingEvent) -> list[str]:
     if event.related_market_ids:
         points.append(
             "Use the related market variants as supporting context, but avoid duplicating the same story in the final writeup."
+        )
+    if overlap and overlap.get("story_role_hint") != "standalone":
+        points.append(
+            "This overlaps with another weekly candidate. Keep the angle distinct and leave a clear note to the editor if the final report should merge the stories."
         )
     return points
 
@@ -239,6 +275,7 @@ def serialize_research_result(result: ResearchResult) -> dict[str, Any]:
         "prompt_version": result.prompt_version,
         "model_name": result.model_name,
         "workflow_type": result.workflow_type,
+        "story_role_hint": result.story_role_hint,
         "status": result.status,
         "explanation_class": result.explanation_class,
         "confidence": result.confidence,
@@ -251,6 +288,9 @@ def serialize_research_result(result: ResearchResult) -> dict[str, Any]:
         "note_to_editor": result.note_to_editor,
         "draft_headline": result.draft_headline,
         "draft_markdown": result.draft_markdown,
+        "overlap_group_key": result.overlap_group_key,
+        "overlap_summary": result.overlap_summary,
+        "suggested_merge_with": list(result.suggested_merge_with),
         "key_evidence": [serialize_evidence_item(item) for item in result.key_evidence],
         "contradictory_evidence": [serialize_evidence_item(item) for item in result.contradictory_evidence],
         "open_questions": list(result.open_questions),
@@ -325,10 +365,14 @@ def _parse_research_job(payload: dict[str, Any]) -> ResearchJob:
         distance_from_extremes=float(story["distance_from_extremes"]),
         entered_extreme_zone=bool(story["entered_extreme_zone"]),
         editorial_priority_hint=story["editorial_priority_hint"],
+        story_role_hint=story.get("story_role_hint", "standalone"),
         investigation_question=str(investigation["question"]),
         why_flagged=str(investigation["why_flagged"]),
         focus_points=tuple(str(point) for point in investigation.get("focus_points", ())),
         primary_market=primary_market,
+        overlap_group_key=story.get("overlap_group_key"),
+        overlap_summary=story.get("overlap_summary"),
+        suggested_merge_with=tuple(str(item) for item in story.get("suggested_merge_with", ())),
         related_markets=related_markets,
     )
 
@@ -434,6 +478,109 @@ def _workflow_type_from_story_hint(story_type_hint: str) -> StoryWorkflowType:
     return "resolution_story"
 
 
+def _default_overlap_assignment() -> dict[str, Any]:
+    return {
+        "overlap_group_key": None,
+        "overlap_summary": None,
+        "suggested_merge_with": (),
+        "story_role_hint": "standalone",
+    }
+
+
+def _build_overlap_assignments(events: Sequence[RepricingEvent]) -> dict[str, dict[str, Any]]:
+    grouped: dict[tuple[str, str, str], list[RepricingEvent]] = {}
+    for event in events:
+        signature = _overlap_signature(event)
+        if signature is None:
+            continue
+        grouped.setdefault(signature, []).append(event)
+
+    assignments: dict[str, dict[str, Any]] = {}
+    for signature, grouped_events in grouped.items():
+        if len(grouped_events) < 2:
+            continue
+        ordered = sorted(grouped_events, key=lambda item: item.composite_score, reverse=True)
+        primary = ordered[0]
+        _, geography, theme = signature
+        for index, event in enumerate(ordered):
+            role_hint: StoryRoleHint = "primary" if index == 0 else "secondary"
+            assignments[event.story_group_key] = {
+                "overlap_group_key": f"{signature[0]}:{geography}:{theme}",
+                "overlap_summary": _build_overlap_summary(
+                    event=event,
+                    group_size=len(ordered),
+                    geography=geography,
+                    theme=theme,
+                    role_hint=role_hint,
+                    primary=primary,
+                ),
+                "suggested_merge_with": tuple(
+                    other.story_group_key for other in ordered if other.story_group_key != event.story_group_key
+                ),
+                "story_role_hint": role_hint,
+            }
+    return assignments
+
+
+def _build_overlap_summary(
+    *,
+    event: RepricingEvent,
+    group_size: int,
+    geography: str,
+    theme: str,
+    role_hint: StoryRoleHint,
+    primary: RepricingEvent,
+) -> str:
+    readable_theme = theme.replace("_", " ")
+    if role_hint == "primary":
+        return (
+            f"This looks like the primary angle in a {group_size}-story {geography} {readable_theme} cluster. "
+            "Adjacent stories probably belong in the same editor review set."
+        )
+    return (
+        f"This overlaps with '{primary.story_group_label}' inside a {group_size}-story {geography} {readable_theme} cluster. "
+        "It may fit better as a merged or secondary angle than as a fully standalone story."
+    )
+
+
+def _overlap_signature(event: RepricingEvent) -> tuple[str, str, str] | None:
+    text = " ".join(
+        part for part in (event.story_group_label, event.market.question, event.market.event_title or "") if part
+    )
+    tokens = _normalized_tokens(text)
+    geography = _dominant_geography_token(tokens)
+    theme = _overlap_theme(tokens)
+    if geography is None and theme == "general":
+        return None
+    return (event.market.category, geography or "global", theme)
+
+
+def _normalized_tokens(text: str) -> tuple[str, ...]:
+    raw_tokens = re.findall(r"[a-z0-9']+", text.lower())
+    normalized = []
+    for token in raw_tokens:
+        mapped = _TOKEN_NORMALIZATION.get(token, token)
+        if mapped in _OVERLAP_STOPWORDS:
+            continue
+        normalized.append(mapped)
+    return tuple(normalized)
+
+
+def _dominant_geography_token(tokens: Sequence[str]) -> str | None:
+    for token in tokens:
+        if token in _GEOGRAPHY_TOKENS:
+            return token
+    return None
+
+
+def _overlap_theme(tokens: Sequence[str]) -> str:
+    token_set = set(tokens)
+    for theme, theme_tokens in _THEME_TOKENS.items():
+        if token_set & theme_tokens:
+            return theme
+    return "general"
+
+
 def _build_price_context(event: RepricingEvent) -> ResearchPriceContext:
     trace_points = _sample_trace_points(
         snapshots=event.series.snapshots,
@@ -510,8 +657,95 @@ def _resolution_surprise_points(event: RepricingEvent) -> float:
 def _surprise_label(points: float | None) -> str | None:
     if points is None:
         return None
-    if points >= 45.0:
+    if points >= 35.0:
         return "high_surprise"
-    if points >= 20.0:
+    if points >= 15.0:
         return "moderate_surprise"
     return "low_surprise"
+
+
+_TOKEN_NORMALIZATION = {
+    "slovenian": "slovenia",
+    "italian": "italy",
+    "iranian": "iran",
+    "israeli": "israel",
+    "lebanese": "lebanon",
+    "american": "us",
+    "u.s": "us",
+    "u.s.": "us",
+    "fed": "us",
+}
+
+_OVERLAP_STOPWORDS = {
+    "will",
+    "the",
+    "a",
+    "an",
+    "of",
+    "by",
+    "in",
+    "to",
+    "be",
+    "most",
+    "next",
+    "party",
+    "2026",
+}
+
+_GEOGRAPHY_TOKENS = {
+    "slovenia",
+    "italy",
+    "iran",
+    "israel",
+    "lebanon",
+    "china",
+    "us",
+    "somalia",
+    "lyon",
+}
+
+_THEME_TOKENS = {
+    "politics_government": {
+        "election",
+        "parliament",
+        "parliamentary",
+        "minister",
+        "prime",
+        "government",
+        "coalition",
+        "referendum",
+        "president",
+        "mayor",
+        "winner",
+    },
+    "military_conflict": {
+        "ceasefire",
+        "strike",
+        "strikes",
+        "offensive",
+        "forces",
+        "war",
+        "missile",
+        "attack",
+        "invade",
+        "military",
+        "ground",
+    },
+    "macro_rates": {
+        "rates",
+        "rate",
+        "inflation",
+        "cpi",
+        "interest",
+        "hike",
+        "cut",
+    },
+    "diplomacy": {
+        "visit",
+        "meeting",
+        "summit",
+        "talks",
+        "xi",
+        "trump",
+    },
+}
