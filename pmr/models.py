@@ -14,6 +14,8 @@ EditorialPriority = Literal["high", "medium", "low"]
 EvidenceSourceType = Literal["x_post", "web_article", "news_article"]
 EvidenceStance = Literal["supporting", "contradictory", "contextual"]
 ResearchStatus = Literal["completed", "insufficient_evidence", "failed"]
+EditorDecisionAction = Literal["include", "merge", "exclude"]
+EditorialDetailLevel = Literal["brief", "standard", "extended", "lead"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,3 +311,97 @@ class ResearchBatchResult:
     @property
     def failed_jobs(self) -> int:
         return sum(1 for result in self.results if result.status == "failed")
+
+
+@dataclass(frozen=True, slots=True)
+class EditorStoryPacket:
+    """Merged editor-stage input with story draft plus rich market context."""
+
+    job_id: str
+    family_key: str
+    family_label: str
+    workflow_type: StoryWorkflowType
+    story_type_hint: StoryTypeHint
+    editorial_priority_hint: EditorialPriority
+    story_role_hint: StoryRoleHint
+    investigation_question: str
+    why_flagged: str
+    focus_points: tuple[str, ...]
+    primary_market: ResearchMarketContext
+    overlap_group_key: str | None
+    overlap_summary: str | None
+    root_cluster_key: str | None
+    root_cluster_summary: str | None
+    suggested_merge_with: tuple[str, ...]
+    related_markets: tuple[RelatedMarket, ...]
+    status: ResearchStatus
+    explanation_class: ExplanationType | None
+    confidence: float
+    model_name: str
+    most_plausible_explanation: str
+    why_market_moved: str
+    price_action_summary: str
+    surprise_assessment: str
+    main_narrative: str
+    alternative_explanations: tuple[str, ...]
+    note_to_editor: str
+    draft_headline: str
+    draft_markdown: str
+    key_evidence: tuple[EvidenceItem, ...]
+    contradictory_evidence: tuple[EvidenceItem, ...]
+    open_questions: tuple[str, ...]
+    completed_at: datetime
+    error_message: str | None = None
+    used_cache: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EditorDecision:
+    """One editorial keep/merge/cut decision for a story packet."""
+
+    job_id: str
+    action: EditorDecisionAction
+    rationale: str
+    detail_level: EditorialDetailLevel
+    merge_with: tuple[str, ...] = ()
+    section_headline: str | None = None
+    section_rank: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ComposedSection:
+    """A final weekly report section produced by the editor/composer."""
+
+    headline: str
+    dek: str
+    body_markdown: str
+    included_job_ids: tuple[str, ...]
+    detail_level: EditorialDetailLevel
+
+
+@dataclass(frozen=True, slots=True)
+class WeeklyReport:
+    """Structured weekly report plus editorial decisions."""
+
+    provider: str
+    prompt_version: str
+    model_name: str
+    generated_at: datetime
+    report_title: str
+    report_subtitle: str
+    editorial_summary: str
+    overall_note_to_reader: str
+    sections: tuple[ComposedSection, ...]
+    decisions: tuple[EditorDecision, ...]
+
+    @property
+    def included_story_count(self) -> int:
+        return sum(1 for decision in self.decisions if decision.action == "include")
+
+    @property
+    def merged_story_count(self) -> int:
+        return sum(1 for decision in self.decisions if decision.action == "merge")
+
+    @property
+    def excluded_story_count(self) -> int:
+        return sum(1 for decision in self.decisions if decision.action == "exclude")

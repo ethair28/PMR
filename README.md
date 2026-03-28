@@ -10,6 +10,7 @@ The current repository provides a working first pass of that flow:
 2. Detect weekly repricing events that happened anywhere inside the last 7 days.
 3. Export typed story-development jobs for a second-stage Grok-backed workflow.
 4. Run an X-first story-development pass and persist structured story drafts.
+5. Run a batch-level editor/composer pass that decides what to publish, merges overlaps, and writes the weekly report.
 
 ## Product Thesis
 
@@ -124,6 +125,7 @@ What is implemented now:
 - Per-story price-action packets, including 8-hour traces over the week, largest-move windows, and surprise metrics for resolution stories.
 - Soft overlap hints that flag which weekly candidates may belong in the same editor-level story cluster.
 - A separate Grok-backed story-development runner that consumes those jobs, routes resolution stories and repricing stories differently, caches normalized evidence in bounded SQLite storage, and writes structured story drafts JSON.
+- A separate Grok multi-agent editor/composer layer that consumes the story drafts plus their richer market context, applies batch-level editorial judgment, compresses dense root-event clusters when appropriate, and writes `weekly-report.json`, `final-report.md`, and `editor-decisions.md`.
 - A sample-data runner so the pipeline works locally without external credentials.
 - An xAI SDK-backed story worker for X-first live research plus web corroboration.
 
@@ -132,7 +134,7 @@ What is not implemented yet:
 - Real-time or scheduled jobs.
 - Email delivery.
 - Historical calibration and analyst-review tooling.
-- Final multi-story newsletter composition.
+- Distribution analytics and subscriber-facing product plumbing.
 
 ## Run
 
@@ -330,6 +332,50 @@ The story-development cache is explicitly bounded:
 - only the two most recent cached versions per job/provider are retained
 - oldest cached batches are pruned if the SQLite file exceeds its size cap
 
+## Run The Editor/Composer Layer
+
+The editor/composer stage is the first layer that turns the structured story drafts into a final weekly package. It consumes both:
+
+- `research-results.json` for the draft stories, evidence, and story-level reasoning
+- `research-inputs.json` for the richer weekly price context and overlap hints
+
+Run it like this:
+
+```bash
+uv run python -m pmr.editor_cli \
+  --input-results-json out/research-results.json \
+  --input-research-json out/research-inputs.json \
+  --output-report-json out/weekly-report.json \
+  --output-markdown out/final-report.md \
+  --output-decisions-markdown out/editor-decisions.md
+```
+
+Or with the package script:
+
+```bash
+uv run pmr-editor \
+  --input-results-json out/research-results.json \
+  --input-research-json out/research-inputs.json
+```
+
+This stage now produces three artifacts:
+
+- `weekly-report.json`: canonical structured editor output
+- `final-report.md`: the reader-facing weekly report
+- `editor-decisions.md`: a separate explanation of inclusion, merge, and exclusion decisions
+
+The editor/composer layer currently assumes the Grok ecosystem and defaults to Grok 4.20 multi-agent with a 4-agent configuration. It is intentionally high-agency:
+
+- there is no fixed story quota
+- a weak week can legitimately produce no final stories
+- a strong week can produce a longer report
+- overlap can be merged aggressively when that improves clarity
+- dense root-event clusters can be compressed so one geopolitical episode does not sprawl into too many adjacent sections
+- more space can be given to stories that carry more user value
+
+The editor prompt explicitly encodes PMR's product thesis so the model is optimizing for the actual report, not a generic newsletter.
+The editor decision log is also linked back to final section headlines and ranks so editorial choices remain auditable.
+
 ## JSON Input Shape
 
 The JSON provider expects a file in this shape:
@@ -441,6 +487,10 @@ Core modules:
 - `pmr/research_engine.py`: query planning, evidence ranking, caching, and story-development orchestration.
 - `pmr/research_store.py`: bounded SQLite cache for normalized evidence and structured story drafts.
 - `pmr/research_xai.py`: xAI SDK-backed X-first story worker with model routing for resolution vs repricing stories.
+- `pmr/editor_payloads.py`: merges story drafts with rich market context and serializes weekly report JSON.
+- `pmr/editor_engine.py`: editor-stage orchestration plus a deterministic heuristic fallback composer.
+- `pmr/editor_xai.py`: xAI SDK-backed Grok multi-agent editor/composer.
+- `pmr/editor_reporting.py`: final report and editor-decision markdown rendering.
 - `pmr/story_groups.py`: story-family keys used for deduping related markets.
 - `pmr/storage.py`: SQLite snapshot persistence, bounded retention, and stored-data loading.
 - `pmr/universe_selection.py`: soft category-floor and overflow-based universe selection.
@@ -452,8 +502,8 @@ Core modules:
 
 The highest-value next milestones are:
 
-1. Improve story-development quality by tightening evidence selection, penalizing weak market-commentary posts, and forcing stronger contradictory-evidence handling.
-2. Build the editor/composer layer that reviews all weekly story drafts, decides which deserve inclusion, merges overlaps, and produces the final report.
+1. Improve repricing-story quality so the story-development worker gets better at explaining messy, unresolved belief shifts rather than drifting toward generic event summaries.
+2. Tighten the editor/composer prompts and decision rubric based on real weekly outputs, especially around overlap handling and dynamic report length.
 3. Add a historical evaluation loop so thresholds and exclusion rules can be calibrated against real weeks of Polymarket behavior.
 4. Add scheduling and delivery once the story-development and editor outputs are stable.
 

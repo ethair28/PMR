@@ -11,3 +11,4 @@ dependencies = [
 [project.scripts]
 pmr = "pmr.cli:main"
 pmr-research = "pmr.research_cli:main"
+pmr-editor = "pmr.editor_cli:main"
