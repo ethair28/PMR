@@ -5,13 +5,41 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Protocol, Sequence
 
-from pmr.models import EvidenceItem, ResearchBatchResult, ResearchJob, ResearchQueryPlan, ResearchResult
+from pmr.models import (
+    EvidenceItem,
+    FollowUpQuery,
+    InvestigationPlan,
+    ResearchBatchResult,
+    ResearchJob,
+    ResearchQueryPlan,
+    ResearchResult,
+)
 from pmr.research_store import ResearchStore
 
 
 class ResearchSource(Protocol):
     def search(self, job: ResearchJob, query_plan: ResearchQueryPlan) -> Sequence[EvidenceItem]:
         """Collect normalized evidence for a research job."""
+
+    def search_follow_up(
+        self,
+        job: ResearchJob,
+        query_plan: ResearchQueryPlan,
+        follow_up_queries: Sequence[FollowUpQuery],
+    ) -> Sequence[EvidenceItem]:
+        """Collect targeted follow-up evidence for a repricing job."""
+
+
+class ResearchPlanner(Protocol):
+    def plan(
+        self,
+        job: ResearchJob,
+        query_plan: ResearchQueryPlan,
+        evidence: Sequence[EvidenceItem],
+        *,
+        generated_at: datetime,
+    ) -> InvestigationPlan:
+        """Turn first-pass repricing evidence into a bounded investigation plan."""
 
 
 class ResearchSynthesizer(Protocol):
@@ -21,6 +49,7 @@ class ResearchSynthesizer(Protocol):
         query_plan: ResearchQueryPlan,
         evidence: Sequence[EvidenceItem],
         *,
+        investigation_plan: InvestigationPlan | None,
         cache_key: str,
         provider_name: str,
         prompt_version: str,
@@ -39,6 +68,7 @@ class HeuristicResearchSynthesizer:
         query_plan: ResearchQueryPlan,
         evidence: Sequence[EvidenceItem],
         *,
+        investigation_plan: InvestigationPlan | None,
         cache_key: str,
         provider_name: str,
         prompt_version: str,
@@ -63,8 +93,14 @@ class HeuristicResearchSynthesizer:
                 price_action_summary=_build_price_action_summary(job),
                 surprise_assessment=_build_surprise_assessment(job),
                 main_narrative="The story remains underdeveloped because the current source mix did not produce enough timely evidence.",
+                belief_shift_drivers=(),
+                signal_types=(),
+                why_now="The current search pass did not recover enough time-aligned evidence to explain why the move accelerated when it did.",
                 alternative_explanations=(
                     "The move may reflect rumor propagation or low-visibility reporting not captured by the current search pass.",
+                ),
+                unresolved_points=(
+                    "There is not yet enough evidence to isolate the main belief-shift driver.",
                 ),
                 note_to_editor="Evidence is too thin for a confident story. Treat this as a watchlist item unless a stronger second pass surfaces new reporting.",
                 draft_headline=job.family_label,
@@ -83,6 +119,7 @@ class HeuristicResearchSynthesizer:
                     "The move may reflect rumors, thin context, or information not captured by the current source mix.",
                 ),
                 completed_at=generated_at,
+                investigation_plan=investigation_plan,
             )
             return result
 
@@ -90,6 +127,11 @@ class HeuristicResearchSynthesizer:
         top_contradictory = contradictory[:2]
         avg_support = (
             sum(item.relevance_score + item.temporal_proximity_score for item in top_support) / len(top_support)
+            if top_support
+            else 0.0
+        )
+        avg_support_quality = (
+            sum(_quality_confidence_weight(item.quality_tier) for item in top_support) / len(top_support)
             if top_support
             else 0.0
         )
@@ -111,6 +153,10 @@ class HeuristicResearchSynthesizer:
             status = "insufficient_evidence"
             explanation_class = "speculative"
             confidence = 0.28
+        if top_support and avg_support_quality < 0.45:
+            confidence = max(0.22, confidence - 0.16)
+            if explanation_class == "clear":
+                explanation_class = "plausible"
 
         lead = top_support[0].title_or_text if top_support else "available evidence is thin"
         explanation = (
@@ -124,6 +170,10 @@ class HeuristicResearchSynthesizer:
             open_questions.append("More evidence is needed before treating this as a settled explanation.")
         if top_contradictory:
             open_questions.append("Contradictory items suggest the story may still be developing.")
+        belief_shift_drivers = _build_belief_shift_drivers(job, top_support)
+        signal_types = _infer_signal_types(top_support)
+        why_now = _build_why_now(job, top_support)
+        unresolved_points = _build_unresolved_points(job, top_contradictory, open_questions)
         headline = _build_heuristic_headline(job)
         main_narrative = explanation
         note_to_editor = (
@@ -145,10 +195,14 @@ class HeuristicResearchSynthesizer:
             price_action_summary=_build_price_action_summary(job),
             surprise_assessment=_build_surprise_assessment(job),
             main_narrative=main_narrative,
+            belief_shift_drivers=belief_shift_drivers,
+            signal_types=signal_types,
+            why_now=why_now,
             alternative_explanations=tuple(
                 "Contradictory or delayed signals could still change the story."
                 for _ in top_contradictory[:1]
             ),
+            unresolved_points=unresolved_points,
             note_to_editor=note_to_editor,
             draft_headline=headline,
             draft_markdown=_build_fallback_draft(job, headline=headline, narrative=main_narrative),
@@ -159,6 +213,7 @@ class HeuristicResearchSynthesizer:
             contradictory_evidence=top_contradictory,
             open_questions=tuple(open_questions),
             completed_at=generated_at,
+            investigation_plan=investigation_plan,
         )
         return result
 
@@ -171,8 +226,10 @@ class ResearchEngine:
     synthesizer: ResearchSynthesizer
     provider_name: str
     prompt_version: str
+    planner: ResearchPlanner | None = None
     store: ResearchStore | None = None
     max_evidence_items: int = 50
+    max_follow_up_queries: int = 5
 
     def run_batch(
         self,
@@ -223,10 +280,41 @@ class ResearchEngine:
                 evidence=evidence,
                 max_items=self.max_evidence_items,
             )
+            investigation_plan: InvestigationPlan | None = None
+            if (
+                job.workflow_type == "repricing_story"
+                and self.planner is not None
+                and ranked_evidence
+            ):
+                try:
+                    investigation_plan = self.planner.plan(
+                        job,
+                        query_plan,
+                        ranked_evidence,
+                        generated_at=now,
+                    )
+                    follow_up_queries = select_follow_up_queries(
+                        investigation_plan,
+                        max_queries=self.max_follow_up_queries,
+                    )
+                    if investigation_plan.needs_more_research and follow_up_queries:
+                        follow_up_evidence = self.source.search_follow_up(
+                            job,
+                            query_plan,
+                            follow_up_queries,
+                        )
+                        ranked_evidence = rank_evidence_for_job(
+                            job=job,
+                            evidence=tuple(ranked_evidence) + tuple(follow_up_evidence),
+                            max_items=self.max_evidence_items,
+                        )
+                except Exception:
+                    investigation_plan = None
             result = self.synthesizer.summarize(
                 job,
                 query_plan,
                 ranked_evidence,
+                investigation_plan=investigation_plan,
                 cache_key=cache_key,
                 provider_name=self.provider_name,
                 prompt_version=self.prompt_version,
@@ -249,7 +337,11 @@ class ResearchEngine:
                 price_action_summary=_build_price_action_summary(job),
                 surprise_assessment=_build_surprise_assessment(job),
                 main_narrative="",
+                belief_shift_drivers=(),
+                signal_types=(),
+                why_now="The story-development run failed before the move-timing explanation could be synthesized.",
                 alternative_explanations=(),
+                unresolved_points=("The story-development run failed before unresolved points could be summarized.",),
                 note_to_editor="The story-development run failed before synthesis completed.",
                 draft_headline=job.family_label,
                 draft_markdown="",
@@ -260,6 +352,7 @@ class ResearchEngine:
                 contradictory_evidence=(),
                 open_questions=("The research run failed before completing synthesis.",),
                 completed_at=now,
+                investigation_plan=None,
                 error_message=str(exc),
             )
         if self.store is not None:
@@ -338,6 +431,53 @@ def build_research_cache_key(job: ResearchJob, *, provider_name: str, prompt_ver
     return f"{job.job_id}:{prompt_version}:{digest}"
 
 
+def select_follow_up_queries(plan: InvestigationPlan, *, max_queries: int) -> tuple[FollowUpQuery, ...]:
+    """Bound and dedupe dynamic follow-up queries while preserving one skeptical check."""
+
+    if max_queries <= 0:
+        return ()
+
+    selected: list[FollowUpQuery] = []
+    seen: set[tuple[str, str]] = set()
+    skeptical_query = plan.skeptical_query
+    skeptical_key = None
+    if skeptical_query is not None:
+        skeptical_key = (skeptical_query.source_type, _clean_query(skeptical_query.query).lower())
+
+    for item in plan.follow_up_queries:
+        normalized_query = _clean_query(item.query)
+        if not normalized_query:
+            continue
+        key = (item.source_type, normalized_query.lower())
+        if key in seen or key == skeptical_key:
+            continue
+        selected.append(
+            FollowUpQuery(
+                query=normalized_query,
+                source_type=item.source_type,
+                reason=item.reason.strip(),
+                skeptical=item.skeptical,
+            )
+        )
+        seen.add(key)
+
+    if skeptical_query is not None and skeptical_key not in seen:
+        skeptical_query = FollowUpQuery(
+            query=_clean_query(skeptical_query.query),
+            source_type=skeptical_query.source_type,
+            reason=skeptical_query.reason.strip(),
+            skeptical=True,
+        )
+
+    if skeptical_query is not None:
+        positive_limit = max(max_queries - 1, 0)
+        trimmed = selected[:positive_limit]
+        if skeptical_query.query:
+            trimmed.append(skeptical_query)
+        return tuple(trimmed[:max_queries])
+    return tuple(selected[:max_queries])
+
+
 def rank_evidence_for_job(
     *,
     job: ResearchJob,
@@ -349,6 +489,8 @@ def rank_evidence_for_job(
     focus_timestamp = job.primary_market.max_move_timestamp or job.primary_market.detection_window_end
     deduped: dict[str, EvidenceItem] = {}
     for item in evidence:
+        if _is_disallowed_recursive_evidence(item):
+            continue
         normalized = _normalize_evidence_item(item, focus_timestamp)
         key = normalized.url.strip().lower().rstrip("/") or normalized.title_or_text.strip().lower()
         current = deduped.get(key)
@@ -383,7 +525,7 @@ def _normalize_evidence_item(item: EvidenceItem, focus_timestamp: datetime) -> E
     proximity = item.temporal_proximity_score
     if item.published_at is not None:
         proximity = max(proximity, _temporal_proximity_score(item.published_at, focus_timestamp))
-    return EvidenceItem(
+    normalized_item = EvidenceItem(
         source_type=item.source_type,
         url=item.url,
         title_or_text=item.title_or_text.strip(),
@@ -395,12 +537,34 @@ def _normalize_evidence_item(item: EvidenceItem, focus_timestamp: datetime) -> E
         stance=item.stance,
         excerpt=item.excerpt.strip(),
         query=item.query.strip() if item.query else None,
+        quality_tier=item.quality_tier,
+    )
+    quality_tier = _evidence_quality_tier(normalized_item)
+    return EvidenceItem(
+        source_type=normalized_item.source_type,
+        url=normalized_item.url,
+        title_or_text=normalized_item.title_or_text,
+        author_or_publication=normalized_item.author_or_publication,
+        published_at=normalized_item.published_at,
+        collected_at=normalized_item.collected_at,
+        relevance_score=normalized_item.relevance_score,
+        temporal_proximity_score=normalized_item.temporal_proximity_score,
+        stance=normalized_item.stance,
+        excerpt=normalized_item.excerpt,
+        query=normalized_item.query,
+        quality_tier=quality_tier,
     )
 
 
 def _combined_evidence_score(item: EvidenceItem) -> float:
     stance_bonus = 0.05 if item.stance == "supporting" else 0.0
-    return item.relevance_score + item.temporal_proximity_score + stance_bonus + _source_quality_adjustment(item)
+    return (
+        item.relevance_score
+        + item.temporal_proximity_score
+        + stance_bonus
+        + _source_quality_adjustment(item)
+        + _quality_tier_adjustment(item.quality_tier)
+    )
 
 
 def _temporal_proximity_score(observed_at: datetime, focus_timestamp: datetime) -> float:
@@ -432,6 +596,61 @@ def _source_quality_adjustment(item: EvidenceItem) -> float:
     if "truthsocial.com" in url or "whitehouse.gov" in url:
         adjustment += 0.18
     return adjustment
+
+
+def _evidence_quality_tier(item: EvidenceItem) -> str:
+    url = item.url.lower()
+    title = item.title_or_text.lower()
+    author = (item.author_or_publication or "").lower()
+    if any(domain in url for domain in _PRIMARY_SIGNAL_DOMAINS):
+        return "primary"
+    if "whitehouse.gov" in url or "truthsocial.com" in url:
+        return "primary"
+    if item.source_type == "x_post":
+        if _is_recursive_model_commentary(item):
+            return "weak_context"
+        if any(token in author for token in _NEWSY_X_ACCOUNTS):
+            return "secondary"
+        if any(token in title for token in _MARKET_COMMENTARY_TERMS) or any(
+            token in author for token in _MARKET_COMMENTARY_HANDLES
+        ):
+            return "weak_context"
+        if any(token in title for token in {"rumor", "reportedly", "possible", "talks"}):
+            return "secondary"
+        return "secondary"
+    if "wikipedia.org" in url:
+        return "weak_context"
+    if item.source_type in {"news_article", "web_article"}:
+        if any(token in url for token in _LOW_SIGNAL_CONTEXT_DOMAINS):
+            return "weak_context"
+        return "secondary"
+    return "secondary"
+
+
+def _quality_tier_adjustment(tier: str) -> float:
+    if tier == "primary":
+        return 0.16
+    if tier == "secondary":
+        return 0.04
+    return -0.16
+
+
+def _quality_confidence_weight(tier: str) -> float:
+    if tier == "primary":
+        return 1.0
+    if tier == "secondary":
+        return 0.6
+    return 0.2
+
+
+def _is_recursive_model_commentary(item: EvidenceItem) -> bool:
+    url = item.url.lower()
+    author = (item.author_or_publication or "").lower()
+    return "x.com/grok/" in url or author == "grok"
+
+
+def _is_disallowed_recursive_evidence(item: EvidenceItem) -> bool:
+    return _is_recursive_model_commentary(item)
 
 
 def _build_price_action_summary(job: ResearchJob) -> str:
@@ -479,6 +698,80 @@ def _build_fallback_draft(job: ResearchJob, *, headline: str, narrative: str) ->
     )
 
 
+def _build_belief_shift_drivers(
+    job: ResearchJob,
+    evidence: Sequence[EvidenceItem],
+) -> tuple[str, ...]:
+    if job.workflow_type != "repricing_story":
+        return ()
+    drivers: list[str] = []
+    for item in evidence[:3]:
+        text = item.title_or_text.strip()
+        if text and text not in drivers:
+            drivers.append(text)
+    if not drivers:
+        drivers.append("No single dominant driver was recoverable from the current evidence mix.")
+    return tuple(drivers)
+
+
+def _infer_signal_types(evidence: Sequence[EvidenceItem]) -> tuple[str, ...]:
+    signal_types: list[str] = []
+    for item in evidence:
+        signal = _signal_type_for_evidence(item)
+        if signal not in signal_types:
+            signal_types.append(signal)
+    return tuple(signal_types)
+
+
+def _signal_type_for_evidence(item: EvidenceItem) -> str:
+    url = item.url.lower()
+    title = item.title_or_text.lower()
+    author = (item.author_or_publication or "").lower()
+    if "whitehouse.gov" in url or "truthsocial.com" in url or "official" in author:
+        return "official_statement"
+    if item.source_type in {"news_article", "web_article"}:
+        return "reporting"
+    if item.source_type == "x_post":
+        if any(token in title for token in _MARKET_COMMENTARY_TERMS) or any(
+            token in author for token in _MARKET_COMMENTARY_HANDLES
+        ):
+            return "market_commentary"
+        if any(token in title for token in {"rumor", "reportedly", "possible", "talks"}):
+            return "rumor_or_speculation"
+        return "social_commentary"
+    return "context"
+
+
+def _build_why_now(job: ResearchJob, evidence: Sequence[EvidenceItem]) -> str:
+    focus = job.primary_market.max_move_timestamp
+    if focus is None:
+        return "The move appears to have built over the week rather than around one clearly isolated timestamp."
+    if not evidence:
+        return (
+            f"The largest move clustered around {focus.isoformat()}, but the current evidence mix does not yet "
+            "identify one clean trigger for that timing."
+        )
+    lead = evidence[0]
+    published = lead.published_at.isoformat() if lead.published_at else "the move window"
+    return (
+        f"The odds moved most sharply around {focus.isoformat()}, and the strongest supporting evidence surfaced "
+        f"around {published}, which is why this story looks tied to that specific window rather than to a slow weekly drift."
+    )
+
+
+def _build_unresolved_points(
+    job: ResearchJob,
+    contradictory: Sequence[EvidenceItem],
+    open_questions: Sequence[str],
+) -> tuple[str, ...]:
+    points = list(open_questions[:2])
+    if job.workflow_type == "repricing_story" and not points:
+        points.append("The move remains unresolved, so later information could still reverse or validate the current narrative.")
+    if contradictory and not any("contradict" in point.lower() for point in points):
+        points.append("Some contradictory evidence remains in the source mix, so confidence should stay bounded.")
+    return tuple(points)
+
+
 _MARKET_COMMENTARY_TERMS = {
     "polymarket",
     "odds",
@@ -516,4 +809,16 @@ _HIGH_SIGNAL_DOMAINS = {
     "aljazeera.com",
     "news.un.org",
     "whitehouse.gov",
+}
+
+_PRIMARY_SIGNAL_DOMAINS = _HIGH_SIGNAL_DOMAINS | {
+    "ft.com",
+    "wsj.com",
+    "nytimes.com",
+    "washingtonpost.com",
+}
+
+_LOW_SIGNAL_CONTEXT_DOMAINS = {
+    "wikipedia.org",
+    "investopedia.com",
 }

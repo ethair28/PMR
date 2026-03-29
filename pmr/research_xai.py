@@ -11,7 +11,18 @@ from xai_sdk import Client
 from xai_sdk.chat import system, user
 from xai_sdk.tools import web_search, x_search
 
-from pmr.models import EvidenceItem, ResearchJob, ResearchQueryPlan, ResearchResult, StoryWorkflowType
+from pmr.models import (
+    EditorialPriority,
+    EvidenceItem,
+    FollowUpQuery,
+    HypothesisAssessment,
+    InvestigationLead,
+    InvestigationPlan,
+    ResearchJob,
+    ResearchQueryPlan,
+    ResearchResult,
+    StoryWorkflowType,
+)
 
 
 DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"
@@ -46,6 +57,37 @@ class _EvidenceEnvelope(BaseModel):
     evidence: list[_EvidenceRecord] = Field(default_factory=list)
 
 
+class _InvestigationLeadRecord(BaseModel):
+    label: str
+    hypothesis: str
+    supporting_signals: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    priority: Literal["high", "medium", "low"] = "medium"
+
+
+class _FollowUpQueryRecord(BaseModel):
+    query: str
+    source_type: Literal["x", "web"] = "web"
+    reason: str
+    skeptical: bool = False
+
+
+class _HypothesisAssessmentRecord(BaseModel):
+    hypothesis: str
+    support_level: Literal["strong", "mixed", "weak"] = "mixed"
+    contradictions: list[str] = Field(default_factory=list)
+    open_uncertainty: list[str] = Field(default_factory=list)
+
+
+class _InvestigationPlanEnvelope(BaseModel):
+    candidate_explanations: list[_InvestigationLeadRecord] = Field(default_factory=list)
+    leading_hypothesis: str = ""
+    follow_up_queries: list[_FollowUpQueryRecord] = Field(default_factory=list)
+    skeptical_query: _FollowUpQueryRecord | None = None
+    assessments: list[_HypothesisAssessmentRecord] = Field(default_factory=list)
+    needs_more_research: bool = False
+
+
 class _SynthesisEnvelope(BaseModel):
     status: Literal["completed", "insufficient_evidence", "failed"] = "failed"
     explanation_class: Literal["clear", "plausible", "speculative"] | None = None
@@ -55,7 +97,11 @@ class _SynthesisEnvelope(BaseModel):
     price_action_summary: str = ""
     surprise_assessment: str = ""
     main_narrative: str = ""
+    belief_shift_drivers: list[str] = Field(default_factory=list)
+    signal_types: list[str] = Field(default_factory=list)
+    why_now: str = ""
     alternative_explanations: list[str] = Field(default_factory=list)
+    unresolved_points: list[str] = Field(default_factory=list)
     note_to_editor: str = ""
     draft_headline: str = ""
     draft_markdown: str = ""
@@ -110,6 +156,28 @@ class XaiResearchSource(_XaiSdkAdapterBase):
 
     def search(self, job: ResearchJob, query_plan: ResearchQueryPlan) -> Sequence[EvidenceItem]:
         prompt = _build_source_prompt(job, query_plan, max_evidence_items=self.max_evidence_items)
+        return self._search_with_prompt(job, query_plan, prompt)
+
+    def search_follow_up(
+        self,
+        job: ResearchJob,
+        query_plan: ResearchQueryPlan,
+        follow_up_queries: Sequence[FollowUpQuery],
+    ) -> Sequence[EvidenceItem]:
+        prompt = _build_follow_up_source_prompt(
+            job,
+            query_plan,
+            follow_up_queries=follow_up_queries,
+            max_evidence_items=self.max_evidence_items,
+        )
+        return self._search_with_prompt(job, query_plan, prompt)
+
+    def _search_with_prompt(
+        self,
+        job: ResearchJob,
+        query_plan: ResearchQueryPlan,
+        prompt: str,
+    ) -> Sequence[EvidenceItem]:
         model_name = self._get_model_for_job(job)
         chat = self._get_client().chat.create(
             model=model_name,
@@ -129,23 +197,103 @@ class XaiResearchSource(_XaiSdkAdapterBase):
         chat.append(system(SOURCE_SYSTEM_PROMPT))
         chat.append(user(prompt))
         _, parsed = chat.parse(_EvidenceEnvelope)
-        collected_at = datetime.now(timezone.utc)
-        return tuple(
-            EvidenceItem(
-                source_type=item.source_type,
-                url=item.url.strip(),
-                title_or_text=item.title_or_text.strip(),
-                author_or_publication=_none_if_blank(item.author_or_publication),
-                published_at=item.published_at,
-                collected_at=collected_at,
-                relevance_score=_clamp_float(item.relevance_score, default=0.5),
-                temporal_proximity_score=_clamp_float(item.temporal_proximity_score, default=0.5),
-                stance=item.stance,
-                excerpt=_truncate((item.excerpt or item.title_or_text).strip()),
-                query=_none_if_blank(item.query),
+        return _normalize_parsed_evidence(parsed)
+
+
+@dataclass(slots=True)
+class XaiRepricingPlanner(_XaiSdkAdapterBase):
+    """xAI SDK-backed bounded planner for second-pass repricing investigation."""
+
+    max_follow_up_queries: int = 5
+    max_candidate_explanations: int = 4
+
+    @classmethod
+    def from_env(cls) -> "XaiRepricingPlanner":
+        api_key = os.environ["XAI_API_KEY"]
+        model = os.environ.get("PMR_XAI_MODEL") or None
+        base_url = os.environ.get("XAI_BASE_URL", DEFAULT_XAI_BASE_URL)
+        return cls(api_key=api_key, model=model, base_url=base_url)
+
+    def plan(
+        self,
+        job: ResearchJob,
+        query_plan: ResearchQueryPlan,
+        evidence: Sequence[EvidenceItem],
+        *,
+        generated_at: datetime,
+    ) -> InvestigationPlan:
+        model_name = self._get_model_for_job(job)
+        chat = self._get_client().chat.create(
+            model=model_name,
+            temperature=0.1,
+            store_messages=False,
+            **_multi_agent_kwargs(model_name),
+        )
+        chat.append(system(PLANNING_SYSTEM_PROMPT))
+        chat.append(
+            user(
+                _build_planning_prompt(
+                    job=job,
+                    query_plan=query_plan,
+                    evidence=evidence,
+                    max_candidate_explanations=self.max_candidate_explanations,
+                    max_follow_up_queries=self.max_follow_up_queries,
+                )
             )
-            for item in parsed.evidence
-            if item.url.strip() and item.title_or_text.strip()
+        )
+        _, parsed = chat.parse(_InvestigationPlanEnvelope)
+        candidate_explanations = tuple(
+            InvestigationLead(
+                label=item.label.strip() or f"Lead {index}",
+                hypothesis=item.hypothesis.strip(),
+                supporting_signals=tuple(text.strip() for text in item.supporting_signals if text.strip()),
+                missing_evidence=tuple(text.strip() for text in item.missing_evidence if text.strip()),
+                priority=_normalize_priority(item.priority),
+            )
+            for index, item in enumerate(parsed.candidate_explanations, start=1)
+            if item.hypothesis.strip()
+        )
+        follow_up_queries = tuple(
+            FollowUpQuery(
+                query=item.query.strip(),
+                source_type=item.source_type,
+                reason=item.reason.strip(),
+                skeptical=bool(item.skeptical),
+            )
+            for item in parsed.follow_up_queries
+            if item.query.strip() and item.reason.strip()
+        )
+        skeptical_query = None
+        if parsed.skeptical_query is not None and parsed.skeptical_query.query.strip():
+            skeptical_query = FollowUpQuery(
+                query=parsed.skeptical_query.query.strip(),
+                source_type=parsed.skeptical_query.source_type,
+                reason=parsed.skeptical_query.reason.strip(),
+                skeptical=True,
+            )
+        assessments = tuple(
+            HypothesisAssessment(
+                hypothesis=item.hypothesis.strip(),
+                support_level=item.support_level,
+                contradictions=tuple(text.strip() for text in item.contradictions if text.strip()),
+                open_uncertainty=tuple(text.strip() for text in item.open_uncertainty if text.strip()),
+            )
+            for item in parsed.assessments
+            if item.hypothesis.strip()
+        )
+        leading_hypothesis = parsed.leading_hypothesis.strip()
+        if not leading_hypothesis and candidate_explanations:
+            leading_hypothesis = candidate_explanations[0].hypothesis
+        return InvestigationPlan(
+            job_id=job.job_id,
+            candidate_explanations=candidate_explanations,
+            leading_hypothesis=leading_hypothesis,
+            follow_up_queries=follow_up_queries,
+            skeptical_query=skeptical_query,
+            assessments=assessments,
+            needs_more_research=bool(
+                parsed.needs_more_research and (bool(follow_up_queries) or skeptical_query is not None)
+            ),
         )
 
 
@@ -166,6 +314,7 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
         query_plan: ResearchQueryPlan,
         evidence: Sequence[EvidenceItem],
         *,
+        investigation_plan: InvestigationPlan | None,
         cache_key: str,
         provider_name: str,
         prompt_version: str,
@@ -185,10 +334,24 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
                     job=job,
                     query_plan=query_plan,
                     evidence=evidence,
+                    investigation_plan=investigation_plan,
                 )
             )
         )
         _, parsed = chat.parse(_SynthesisEnvelope)
+        most_plausible_explanation = parsed.most_plausible_explanation.strip()
+        why_market_moved = parsed.why_market_moved.strip() or most_plausible_explanation
+        price_action_summary = parsed.price_action_summary.strip() or _fallback_price_action_summary(job)
+        surprise_assessment = parsed.surprise_assessment.strip() or _fallback_surprise_assessment(job)
+        main_narrative = parsed.main_narrative.strip() or why_market_moved or most_plausible_explanation
+        why_now = parsed.why_now.strip() or _fallback_why_now(job)
+        note_to_editor = parsed.note_to_editor.strip() or _fallback_note_to_editor(job)
+        draft_headline = parsed.draft_headline.strip() or job.family_label
+        draft_markdown = parsed.draft_markdown.strip() or _fallback_draft_markdown(
+            headline=draft_headline,
+            main_narrative=main_narrative,
+            why_now=why_now,
+        )
         return ResearchResult(
             job_id=job.job_id,
             cache_key=cache_key,
@@ -200,15 +363,19 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
             status=parsed.status,
             explanation_class=parsed.explanation_class,
             confidence=_clamp_float(parsed.confidence, default=0.0),
-            most_plausible_explanation=parsed.most_plausible_explanation.strip(),
-            why_market_moved=parsed.why_market_moved.strip(),
-            price_action_summary=parsed.price_action_summary.strip(),
-            surprise_assessment=parsed.surprise_assessment.strip(),
-            main_narrative=parsed.main_narrative.strip(),
+            most_plausible_explanation=most_plausible_explanation,
+            why_market_moved=why_market_moved,
+            price_action_summary=price_action_summary,
+            surprise_assessment=surprise_assessment,
+            main_narrative=main_narrative,
+            belief_shift_drivers=tuple(item.strip() for item in parsed.belief_shift_drivers if item.strip()),
+            signal_types=tuple(item.strip() for item in parsed.signal_types if item.strip()),
+            why_now=why_now,
             alternative_explanations=tuple(item.strip() for item in parsed.alternative_explanations if item.strip()),
-            note_to_editor=parsed.note_to_editor.strip(),
-            draft_headline=parsed.draft_headline.strip(),
-            draft_markdown=parsed.draft_markdown.strip(),
+            unresolved_points=tuple(item.strip() for item in parsed.unresolved_points if item.strip()),
+            note_to_editor=note_to_editor,
+            draft_headline=draft_headline,
+            draft_markdown=draft_markdown,
             overlap_group_key=job.overlap_group_key,
             overlap_summary=job.overlap_summary,
             suggested_merge_with=job.suggested_merge_with,
@@ -216,6 +383,7 @@ class XaiResearchSynthesizer(_XaiSdkAdapterBase):
             contradictory_evidence=tuple(item for item in evidence if item.stance == "contradictory")[:3],
             open_questions=tuple(item.strip() for item in parsed.open_questions if item.strip()),
             completed_at=generated_at,
+            investigation_plan=investigation_plan,
             error_message=_none_if_blank(parsed.error_message),
         )
 
@@ -230,6 +398,23 @@ Prefer underlying reporting, official statements, and directly relevant local/ne
 """
 
 
+PLANNING_SYSTEM_PROMPT = """You are a bounded investigative planner for a prediction-market repricing story.
+
+You will receive the market context, price action, first-pass evidence, and the product goal: explain why belief changed, not just what happened.
+
+Return only structured data matching the provided schema.
+
+Your task is to behave like a real investigator within a bounded budget:
+- identify the top 2-4 plausible explanations
+- say what evidence currently supports them
+- say what evidence is still missing
+- propose a small number of targeted follow-up searches
+- include one skeptical/disconfirming search when another search round is worthwhile
+
+Do not create a rigid checklist. Propose only the follow-up searches that would most improve confidence in the story. If the first-pass evidence is already decisive, set needs_more_research to false.
+"""
+
+
 SYNTHESIS_SYSTEM_PROMPT = """You are a prediction-market story developer.
 
 You will receive a market, a search plan, weekly price-action context, and normalized evidence items that already came from xAI search tools. Return only structured data matching the provided schema.
@@ -240,6 +425,11 @@ Draft requirements:
 - keep the tone concise, factual, and information-dense
 - lead with the trigger and the market move
 - for repricing stories, distinguish what happened from why traders changed their minds
+- evidence items include a quality_tier field: build the main thesis from primary and secondary evidence, and use weak_context items mostly as color, amplification, or caution
+- if the support is mostly weak_context, lower confidence and say that explicitly
+- for repricing stories, explicitly fill belief_shift_drivers, signal_types, why_now, and unresolved_points
+- for repricing stories, use short signal_types labels such as official_statement, reporting, rumor_or_speculation, social_commentary, market_spillover, or analyst_commentary
+- for repricing stories, do not collapse into pure event summary; explain the belief shift and what remains unresolved
 - for resolution stories, explicitly quantify the surprise
 - make note_to_editor short and actionable
 - if overlap metadata suggests a merge, mention that directly in note_to_editor
@@ -267,6 +457,7 @@ def _build_source_prompt(job: ResearchJob, query_plan: ResearchQueryPlan, *, max
         f"Weekly price trace (8h): {_format_price_trace(job)}\n"
         f"Surprise context: {_format_surprise_context(job)}\n"
         f"Overlap context: {_format_overlap_context(job)}\n"
+        f"Repricing quality requirements: {_format_repricing_requirements(job)}\n"
         f"Focus points: {', '.join(query_plan.focus_points) if query_plan.focus_points else 'none'}\n"
         f"X queries: {', '.join(query_plan.x_queries)}\n"
         f"Web queries: {', '.join(query_plan.web_queries)}\n"
@@ -276,11 +467,76 @@ def _build_source_prompt(job: ResearchJob, query_plan: ResearchQueryPlan, *, max
     )
 
 
+def _build_follow_up_source_prompt(
+    job: ResearchJob,
+    query_plan: ResearchQueryPlan,
+    *,
+    follow_up_queries: Sequence[FollowUpQuery],
+    max_evidence_items: int,
+) -> str:
+    formatted_queries = "\n".join(
+        f"- [{item.source_type}] {item.query} :: {item.reason}"
+        + (" [skeptical]" if item.skeptical else "")
+        for item in follow_up_queries
+    )
+    return (
+        f"Run a second-pass investigation for this repricing story and return at most {max_evidence_items} normalized evidence items.\n\n"
+        f"Story: {job.family_label}\n"
+        f"Workflow type: {job.workflow_type}\n"
+        f"Investigation question: {job.investigation_question}\n"
+        f"Why flagged: {job.why_flagged}\n"
+        f"Primary market question: {job.primary_market.question}\n"
+        f"Detection window: {job.primary_market.detection_window_start.isoformat()} to "
+        f"{job.primary_market.detection_window_end.isoformat()}\n"
+        f"Max move timestamp: "
+        f"{job.primary_market.max_move_timestamp.isoformat() if job.primary_market.max_move_timestamp else 'n/a'}\n"
+        f"Weekly price trace (8h): {_format_price_trace(job)}\n"
+        f"Overlap context: {_format_overlap_context(job)}\n"
+        f"Follow-up searches to run:\n{formatted_queries or '- none'}\n"
+        "The goal of this second pass is to validate or disprove the leading repricing explanations, not to collect generic background."
+    )
+
+
+def _build_planning_prompt(
+    *,
+    job: ResearchJob,
+    query_plan: ResearchQueryPlan,
+    evidence: Sequence[EvidenceItem],
+    max_candidate_explanations: int,
+    max_follow_up_queries: int,
+) -> str:
+    lines = [
+        f"Story: {job.family_label}",
+        f"Workflow type: {job.workflow_type}",
+        f"Story type hint: {job.story_type_hint}",
+        f"Investigation question: {job.investigation_question}",
+        f"Why flagged: {job.why_flagged}",
+        f"Primary market: {job.primary_market.question}",
+        f"Detection window: {query_plan.time_window_start.isoformat()} to {query_plan.time_window_end.isoformat()}",
+        f"Focus timestamp: {query_plan.focus_timestamp.isoformat() if query_plan.focus_timestamp else 'n/a'}",
+        f"Price action summary packet: {_format_price_context(job)}",
+        f"Overlap context: {_format_overlap_context(job)}",
+        f"Repricing quality requirements: {_format_repricing_requirements(job)}",
+        f"Return at most {max_candidate_explanations} candidate explanations and at most {max_follow_up_queries} follow-up queries.",
+        "First-pass evidence:",
+    ]
+    for index, item in enumerate(evidence, start=1):
+        published_at = item.published_at.isoformat() if item.published_at else "n/a"
+        lines.append(
+            f"{index}. [{item.source_type}] {item.title_or_text} | url={item.url} | "
+            f"author={item.author_or_publication or 'n/a'} | published_at={published_at} | "
+            f"relevance={item.relevance_score:.2f} | temporal={item.temporal_proximity_score:.2f} | "
+            f"stance={item.stance} | quality_tier={item.quality_tier}"
+        )
+    return "\n".join(lines)
+
+
 def _build_synthesis_prompt(
     *,
     job: ResearchJob,
     query_plan: ResearchQueryPlan,
     evidence: Sequence[EvidenceItem],
+    investigation_plan: InvestigationPlan | None,
 ) -> str:
     lines = [
         f"Story: {job.family_label}",
@@ -294,6 +550,8 @@ def _build_synthesis_prompt(
         f"Focus timestamp: {query_plan.focus_timestamp.isoformat() if query_plan.focus_timestamp else 'n/a'}",
         f"Price action summary packet: {_format_price_context(job)}",
         f"Overlap context: {_format_overlap_context(job)}",
+        f"Repricing quality requirements: {_format_repricing_requirements(job)}",
+        f"Investigation plan: {_format_investigation_plan(investigation_plan)}",
         "Evidence:",
     ]
     for index, item in enumerate(evidence, start=1):
@@ -302,7 +560,7 @@ def _build_synthesis_prompt(
             f"{index}. [{item.source_type}] {item.title_or_text} | url={item.url} | "
             f"author={item.author_or_publication or 'n/a'} | published_at={published_at} | "
             f"relevance={item.relevance_score:.2f} | temporal={item.temporal_proximity_score:.2f} | "
-            f"stance={item.stance}"
+            f"stance={item.stance} | quality_tier={item.quality_tier}"
         )
     return "\n".join(lines)
 
@@ -362,6 +620,40 @@ def _format_overlap_context(job: ResearchJob) -> str:
         f"group={job.overlap_group_key} role={job.story_role_hint} "
         f"merge_with={', '.join(job.suggested_merge_with) if job.suggested_merge_with else 'none'} "
         f"summary={job.overlap_summary or 'n/a'}"
+    )
+
+
+def _format_repricing_requirements(job: ResearchJob) -> str:
+    if job.workflow_type != "repricing_story":
+        return "This is not a repricing story. Focus on surprise calibration and decisive resolution evidence."
+    return (
+        "State what specifically changed belief, classify the signals that did the work, explain why the move "
+        "accelerated when it did, and list what is still unresolved. If the evidence mostly explains the event "
+        "but not the repricing timing, say that explicitly."
+    )
+
+
+def _format_investigation_plan(plan: InvestigationPlan | None) -> str:
+    if plan is None:
+        return "none"
+    candidate_labels = "; ".join(
+        f"{item.label}: {item.hypothesis}" for item in plan.candidate_explanations
+    ) or "none"
+    follow_up_queries = "; ".join(
+        f"[{item.source_type}] {item.query}" + (" (skeptical)" if item.skeptical else "")
+        for item in plan.follow_up_queries
+    ) or "none"
+    skeptical = (
+        f"[{plan.skeptical_query.source_type}] {plan.skeptical_query.query}"
+        if plan.skeptical_query is not None
+        else "none"
+    )
+    return (
+        f"leading_hypothesis={plan.leading_hypothesis or 'n/a'} | "
+        f"needs_more_research={plan.needs_more_research} | "
+        f"candidates={candidate_labels} | "
+        f"follow_up_queries={follow_up_queries} | "
+        f"skeptical_query={skeptical}"
     )
 
 
@@ -432,11 +724,85 @@ def _multi_agent_kwargs(model_name: str) -> dict[str, int]:
     return {}
 
 
+def _normalize_parsed_evidence(parsed: _EvidenceEnvelope) -> tuple[EvidenceItem, ...]:
+    collected_at = datetime.now(timezone.utc)
+    return tuple(
+        EvidenceItem(
+            source_type=item.source_type,
+            url=item.url.strip(),
+            title_or_text=item.title_or_text.strip(),
+            author_or_publication=_none_if_blank(item.author_or_publication),
+            published_at=item.published_at,
+            collected_at=collected_at,
+            relevance_score=_clamp_float(item.relevance_score, default=0.5),
+            temporal_proximity_score=_clamp_float(item.temporal_proximity_score, default=0.5),
+            stance=item.stance,
+            excerpt=_truncate((item.excerpt or item.title_or_text).strip()),
+            query=_none_if_blank(item.query),
+        )
+        for item in parsed.evidence
+        if item.url.strip() and item.title_or_text.strip()
+    )
+
+
+def _normalize_priority(value: str) -> EditorialPriority:
+    normalized = value.strip().lower()
+    if normalized in {"high", "medium", "low"}:
+        return normalized  # type: ignore[return-value]
+    return "medium"
+
+
 def _none_if_blank(value: str | None) -> str | None:
     if value is None:
         return None
     text = value.strip()
     return text or None
+
+
+def _fallback_price_action_summary(job: ResearchJob) -> str:
+    market = job.primary_market
+    return (
+        f"The market moved from {market.window_open_probability * 100:.1f}% to "
+        f"{market.window_close_probability * 100:.1f}% over the detection week, with a "
+        f"{market.weekly_range * 100:.1f} point range and a maximum 24h move of "
+        f"{market.max_abs_move_24h * 100:.1f} points."
+    )
+
+
+def _fallback_surprise_assessment(job: ResearchJob) -> str:
+    context = job.primary_market.price_context
+    if context.surprise_points is not None:
+        return (
+            f"The market resolved with roughly {context.surprise_points:.1f} surprise points "
+            f"relative to its pre-resolution probability."
+        )
+    return "This remained a repricing story rather than a clean resolution, so the value lies in explaining the shift in belief."
+
+
+def _fallback_why_now(job: ResearchJob) -> str:
+    if job.primary_market.max_move_timestamp is not None:
+        return (
+            f"The move accelerated around {job.primary_market.max_move_timestamp.isoformat()}, so the best explanation "
+            f"should be anchored to information that surfaced immediately before or during that window."
+        )
+    return "The move timing is only partially pinned down, so the explanation should stay cautious about why the repricing accelerated when it did."
+
+
+def _fallback_note_to_editor(job: ResearchJob) -> str:
+    if job.overlap_group_key:
+        return "This overlaps with another candidate. Consider merging unless this draft adds a clearly distinct angle."
+    if job.workflow_type == "repricing_story":
+        return "Keep the emphasis on belief shift and residual uncertainty rather than forcing a clean resolution narrative."
+    return "Use this as a concise resolution story and keep the surprise calibration explicit."
+
+
+def _fallback_draft_markdown(*, headline: str, main_narrative: str, why_now: str) -> str:
+    paragraphs = [f"## {headline}"]
+    if main_narrative:
+        paragraphs.append(main_narrative)
+    if why_now:
+        paragraphs.append(f"Why now: {why_now}")
+    return "\n\n".join(paragraphs).strip()
 
 
 def _truncate(value: str, limit: int = 2_000) -> str:

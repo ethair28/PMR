@@ -18,12 +18,16 @@ class MonitoringConfig:
     min_open_interest_usd: float = 10_000.0
     short_history_penalty: float = 0.35
     low_confidence_penalty: float = 0.25
+    exact_date_conflict_timing_penalty: float = 3.0
+    late_stage_resolution_penalty: float = 1.5
     max_events: int = 12
+    min_live_repricing_events: int = 6
     min_markets_per_category: int = 5
     max_category_share_of_universe: float | None = 0.6
     max_markets_per_category: int | None = None
     max_contracts_per_event: int = 2
     max_events_per_story_family: int = 1
+    max_exact_date_conflict_timing_per_root_cluster: int = 1
     max_related_markets_per_story: int = 3
     target_categories: tuple[str, ...] = (
         "politics",

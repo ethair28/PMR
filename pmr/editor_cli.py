@@ -4,10 +4,15 @@ import argparse
 import json
 from pathlib import Path
 
+from pmr.chart_renderer import build_chart_manifest_payload, render_report_charts
 from pmr.editor_engine import EditorEngine, HeuristicEditorComposer
-from pmr.editor_payloads import build_weekly_report_payload, load_editor_story_packets_from_files
+from pmr.editor_payloads import (
+    build_weekly_report_payload,
+    load_editor_story_packets_from_files,
+)
 from pmr.editor_reporting import render_editor_decisions_markdown, render_weekly_report_markdown
 from pmr.editor_xai import XaiEditorComposer
+from pmr.packaging import package_weekly_report
 from pmr.research_cli import _load_dotenv_if_present
 
 
@@ -50,6 +55,18 @@ def main() -> int:
         help="Path to write the separate editor decision log markdown.",
     )
     parser.add_argument(
+        "--charts-dir",
+        type=Path,
+        default=Path("out/charts"),
+        help="Directory for rendered chart PNG assets.",
+    )
+    parser.add_argument(
+        "--output-chart-manifest-json",
+        type=Path,
+        default=Path("out/charts/manifest.json"),
+        help="Path to write the chart asset manifest JSON.",
+    )
+    parser.add_argument(
         "--provider",
         choices=("xai", "heuristic"),
         default="xai",
@@ -75,14 +92,18 @@ def main() -> int:
         prompt_version=PROMPT_VERSION,
     )
     report = engine.run(stories)
+    report = package_weekly_report(report, stories)
+    report = render_report_charts(report, stories, output_dir=args.charts_dir)
 
     report_json = json.dumps(build_weekly_report_payload(report), indent=2)
     report_markdown = render_weekly_report_markdown(report)
     decisions_markdown = render_editor_decisions_markdown(report)
+    chart_manifest_json = json.dumps(build_chart_manifest_payload(report), indent=2)
 
     _write_text(args.output_report_json, report_json)
     _write_text(args.output_markdown, report_markdown)
     _write_text(args.output_decisions_markdown, decisions_markdown)
+    _write_text(args.output_chart_manifest_json, chart_manifest_json)
 
     if args.print_markdown:
         print(report_markdown)

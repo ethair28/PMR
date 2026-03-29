@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from pmr.models import (
+    ChartAsset,
     ComposedSection,
     EditorDecision,
     EditorStoryPacket,
@@ -54,13 +55,13 @@ def build_weekly_report_payload(report: WeeklyReport) -> dict[str, Any]:
         "model_name": report.model_name,
         "report_title": report.report_title,
         "report_subtitle": report.report_subtitle,
-        "editorial_summary": report.editorial_summary,
-        "overall_note_to_reader": report.overall_note_to_reader,
+        "opening_markdown": report.opening_markdown,
         "included_story_count": report.included_story_count,
         "merged_story_count": report.merged_story_count,
         "excluded_story_count": report.excluded_story_count,
         "sections": [serialize_composed_section(section) for section in report.sections],
         "decisions": [serialize_editor_decision(decision) for decision in report.decisions],
+        "chart_assets": [serialize_chart_asset(asset) for asset in report.chart_assets],
     }
 
 
@@ -68,9 +69,13 @@ def serialize_composed_section(section: ComposedSection) -> dict[str, Any]:
     return {
         "headline": section.headline,
         "dek": section.dek,
+        "bottom_line": section.bottom_line,
+        "summary_points": list(section.summary_points),
         "body_markdown": section.body_markdown,
         "included_job_ids": list(section.included_job_ids),
         "detail_level": section.detail_level,
+        "primary_chart_job_id": section.primary_chart_job_id,
+        "chart_asset_id": section.chart_asset_id,
     }
 
 
@@ -85,6 +90,17 @@ def serialize_editor_decision(decision: EditorDecision) -> dict[str, Any]:
         "section_rank": decision.section_rank,
     }
 
+
+def serialize_chart_asset(asset: ChartAsset) -> dict[str, Any]:
+    return {
+        "asset_id": asset.asset_id,
+        "job_id": asset.job_id,
+        "section_headline": asset.section_headline,
+        "local_path": asset.local_path,
+        "alt_text": asset.alt_text,
+        "width": asset.width,
+        "height": asset.height,
+    }
 
 def _parse_editor_story_packet(payload: dict[str, Any], job: ResearchJob) -> EditorStoryPacket:
     root_cluster_key, root_cluster_summary = _build_root_cluster(job)
@@ -115,7 +131,11 @@ def _parse_editor_story_packet(payload: dict[str, Any], job: ResearchJob) -> Edi
         price_action_summary=str(payload.get("price_action_summary", "")),
         surprise_assessment=str(payload.get("surprise_assessment", "")),
         main_narrative=str(payload.get("main_narrative", "")),
+        belief_shift_drivers=tuple(str(item) for item in payload.get("belief_shift_drivers", ())),
+        signal_types=tuple(str(item) for item in payload.get("signal_types", ())),
+        why_now=str(payload.get("why_now", "")),
         alternative_explanations=tuple(str(item) for item in payload.get("alternative_explanations", ())),
+        unresolved_points=tuple(str(item) for item in payload.get("unresolved_points", ())),
         note_to_editor=str(payload.get("note_to_editor", "")),
         draft_headline=str(payload.get("draft_headline", "")),
         draft_markdown=str(payload.get("draft_markdown", "")),
@@ -192,6 +212,7 @@ def _parse_evidence_item(payload: dict[str, Any]) -> EvidenceItem:
         stance=payload["stance"],
         excerpt=str(payload["excerpt"]),
         query=payload.get("query"),
+        quality_tier=str(payload.get("quality_tier", "secondary")),
     )
 
 

@@ -30,6 +30,8 @@ class _EditorDecisionRecord(BaseModel):
 class _EditorSectionRecord(BaseModel):
     headline: str
     dek: str = ""
+    bottom_line: str = ""
+    summary_points: list[str] = Field(default_factory=list)
     body_markdown: str
     included_job_ids: list[str] = Field(default_factory=list)
     detail_level: Literal["brief", "standard", "extended", "lead"] = "standard"
@@ -38,8 +40,7 @@ class _EditorSectionRecord(BaseModel):
 class _EditorEnvelope(BaseModel):
     report_title: str
     report_subtitle: str = ""
-    editorial_summary: str
-    overall_note_to_reader: str = ""
+    opening_markdown: str
     sections: list[_EditorSectionRecord] = Field(default_factory=list)
     decisions: list[_EditorDecisionRecord] = Field(default_factory=list)
 
@@ -80,6 +81,20 @@ class XaiEditorComposer:
         chat.append(system(EDITOR_SYSTEM_PROMPT))
         chat.append(user(_build_editor_prompt(stories, generated_at=generated_at)))
         _, parsed = chat.parse(_EditorEnvelope)
+        sections = tuple(
+            ComposedSection(
+                headline=item.headline.strip(),
+                body_markdown=item.body_markdown.strip(),
+                included_job_ids=tuple(job_id for job_id in item.included_job_ids if job_id),
+                detail_level=item.detail_level,
+                dek=item.dek.strip(),
+                bottom_line=item.bottom_line.strip(),
+                summary_points=tuple(point.strip() for point in item.summary_points if point.strip()),
+                primary_chart_job_id=None,
+                chart_asset_id=None,
+            )
+            for item in parsed.sections
+        )
         return WeeklyReport(
             provider=provider_name,
             prompt_version=prompt_version,
@@ -87,18 +102,8 @@ class XaiEditorComposer:
             generated_at=generated_at,
             report_title=parsed.report_title.strip(),
             report_subtitle=parsed.report_subtitle.strip(),
-            editorial_summary=parsed.editorial_summary.strip(),
-            overall_note_to_reader=parsed.overall_note_to_reader.strip(),
-            sections=tuple(
-                ComposedSection(
-                    headline=item.headline.strip(),
-                    dek=item.dek.strip(),
-                    body_markdown=item.body_markdown.strip(),
-                    included_job_ids=tuple(job_id for job_id in item.included_job_ids if job_id),
-                    detail_level=item.detail_level,
-                )
-                for item in parsed.sections
-            ),
+            opening_markdown=parsed.opening_markdown.strip(),
+            sections=sections,
             decisions=tuple(
                 EditorDecision(
                     job_id=item.job_id,
@@ -144,6 +149,10 @@ Editorial instructions:
 - Give more detail to stronger stories and less detail to marginal ones. Use `lead`, `standard`, `extended`, or `brief` intentionally.
 - Resolution stories should emphasize surprise calibration.
 - Repricing stories should emphasize what changed perception, what remains uncertain, and why the move matters.
+- Make the report easy to read and high-signal. Readers should understand the main value quickly, but you do not need to force every section into the same template.
+- You may vary pacing, section shape, and how directly you front-load the takeaway when that improves the report.
+- A separate downstream layer only renders the report and attaches a simple primary-market weekly chart to each section. Do not optimize for packaging formats.
+- Your single publication target is the final weekly report markdown. Do not optimize for X posts, thread structure, or cross-channel shareability.
 - Return a decision for every candidate story.
 - Every decision must include the section headline and section rank for included or merged stories.
 - Return structured sections for the final report plus clear decision rationales.
@@ -180,6 +189,9 @@ def _build_editor_prompt(stories: Sequence[EditorStoryPacket], *, generated_at: 
                 f"   investigation_question={story.investigation_question}",
                 f"   price_action={story.price_action_summary}",
                 f"   surprise_assessment={story.surprise_assessment or 'n/a'}",
+                f"   belief_shift_drivers={'; '.join(story.belief_shift_drivers) or 'none'}",
+                f"   signal_types={'; '.join(story.signal_types) or 'none'}",
+                f"   why_now={story.why_now or 'n/a'}",
                 f"   overlap_context={_format_overlap(story)}",
                 f"   root_cluster={story.root_cluster_key or 'standalone'}",
                 f"   root_cluster_summary={story.root_cluster_summary or 'n/a'}",
@@ -188,6 +200,7 @@ def _build_editor_prompt(stories: Sequence[EditorStoryPacket], *, generated_at: 
                 f"   note_to_editor={story.note_to_editor or 'n/a'}",
                 f"   main_narrative={story.main_narrative or story.most_plausible_explanation}",
                 f"   alternative_explanations={'; '.join(story.alternative_explanations) or 'none'}",
+                f"   unresolved_points={'; '.join(story.unresolved_points) or 'none'}",
                 f"   open_questions={'; '.join(story.open_questions) or 'none'}",
                 "   key_evidence:",
                 *_format_evidence_lines(story.key_evidence, indent="     - "),
@@ -204,11 +217,11 @@ def _build_editor_prompt(stories: Sequence[EditorStoryPacket], *, generated_at: 
         [
             "Return:",
             "- a final report title and subtitle",
-            "- an editorial summary explaining the overall weekly package",
+            "- an opening_markdown field that opens the report in the way you judge best",
             "- zero or more final sections with markdown bodies",
+            "- optional bottom_line and summary_points on sections when they genuinely help readability",
             "- one explicit decision per job_id",
             "- section_headline and section_rank on every included or merged decision",
-            "- an overall note to reader if useful",
         ]
     )
     return "\n".join(lines)

@@ -8,6 +8,10 @@ from pathlib import Path
 
 from pmr.models import (
     EvidenceItem,
+    FollowUpQuery,
+    HypothesisAssessment,
+    InvestigationLead,
+    InvestigationPlan,
     PriceTracePoint,
     RelatedMarket,
     ResearchJob,
@@ -18,9 +22,11 @@ from pmr.models import (
 from pmr.research_engine import (
     HeuristicResearchSynthesizer,
     ResearchEngine,
+    ResearchPlanner,
     ResearchSource,
     build_research_query_plan,
     rank_evidence_for_job,
+    select_follow_up_queries,
 )
 from pmr.research_cli import _load_dotenv_if_present
 from pmr.research_payloads import build_research_results_payload, load_research_jobs_from_payload
@@ -94,6 +100,7 @@ class ResearchPayloadTests(unittest.TestCase):
                         },
                         "price_context": {
                             "interval_hours": 8,
+                            "chart_interval_minutes": 60,
                             "largest_move_window_hours": 24,
                             "largest_move_window_start": "2026-03-23T09:00:00+00:00",
                             "largest_move_window_end": "2026-03-24T09:00:00+00:00",
@@ -111,7 +118,19 @@ class ResearchPayloadTests(unittest.TestCase):
                                     "probability": 0.58,
                                     "move_since_previous": -0.04
                                 }
-                            ]
+                            ],
+                            "chart_trace_points": [
+                                {
+                                    "observed_at": "2026-03-17T00:00:00+00:00",
+                                    "probability": 0.62,
+                                    "move_since_previous": None
+                                },
+                                {
+                                    "observed_at": "2026-03-17T01:00:00+00:00",
+                                    "probability": 0.60,
+                                    "move_since_previous": -0.02
+                                }
+                            ],
                         },
                         "notes": ["note 1"],
                     },
@@ -128,6 +147,8 @@ class ResearchPayloadTests(unittest.TestCase):
         self.assertEqual(jobs[0].story_role_hint, "standalone")
         self.assertEqual(jobs[0].primary_market.question, "Will Trump visit China by April 30?")
         self.assertEqual(jobs[0].primary_market.price_context.interval_hours, 8)
+        self.assertEqual(jobs[0].primary_market.price_context.chart_interval_minutes, 60)
+        self.assertEqual(len(jobs[0].primary_market.price_context.chart_trace_points), 2)
         self.assertEqual(jobs[0].related_markets[0].market_id, "market-2")
 
     def test_dotenv_loader_trims_whitespace_and_preserves_existing_env(self) -> None:
@@ -209,6 +230,27 @@ class ResearchEngineTests(unittest.TestCase):
         ranked = rank_evidence_for_job(job=job, evidence=(wikipedia, market_commentary, strong_news), max_items=3)
 
         self.assertEqual(ranked[0].url, "https://www.reuters.com/world/example")
+        self.assertEqual(ranked[0].quality_tier, "primary")
+        self.assertEqual(ranked[1].quality_tier, "weak_context")
+        self.assertEqual(ranked[2].quality_tier, "weak_context")
+
+    def test_rank_evidence_excludes_recursive_grok_posts(self) -> None:
+        job = _build_job()
+        recursive = _build_evidence(
+            url="https://x.com/grok/status/1",
+            title="Grok explains why the market moved",
+            source_type="x_post",
+            author="Grok",
+        )
+        strong_news = _build_evidence(
+            url="https://www.reuters.com/world/example",
+            title="Reuters report",
+        )
+
+        ranked = rank_evidence_for_job(job=job, evidence=(recursive, strong_news), max_items=3)
+
+        self.assertEqual(len(ranked), 1)
+        self.assertEqual(ranked[0].url, "https://www.reuters.com/world/example")
 
     def test_heuristic_synthesizer_marks_insufficient_when_no_evidence(self) -> None:
         job = _build_job()
@@ -219,6 +261,7 @@ class ResearchEngineTests(unittest.TestCase):
             job,
             plan,
             (),
+            investigation_plan=None,
             cache_key="cache-1",
             provider_name="test",
             prompt_version="v1",
@@ -228,6 +271,9 @@ class ResearchEngineTests(unittest.TestCase):
         self.assertEqual(result.status, "insufficient_evidence")
         self.assertEqual(result.explanation_class, "speculative")
         self.assertIn("not surface enough evidence", result.most_plausible_explanation)
+        self.assertEqual(result.belief_shift_drivers, ())
+        self.assertEqual(result.signal_types, ())
+        self.assertTrue(result.why_now)
 
     def test_batch_continues_after_one_job_failure(self) -> None:
         jobs = (_build_job("job-1"), _build_job("job-2"))
@@ -247,6 +293,172 @@ class ResearchEngineTests(unittest.TestCase):
         self.assertEqual(batch.failed_jobs, 1)
         self.assertEqual(batch.results[0].status, "completed")
         self.assertEqual(batch.results[1].status, "failed")
+
+    def test_repricing_job_uses_planner_and_follow_up_search(self) -> None:
+        job = _build_job()
+        source = _PlannerAwareSource(
+            initial_evidence=(_build_evidence(url="https://example.com/initial", title="Initial report"),),
+            follow_up_evidence=(
+                _build_evidence(
+                    url="https://example.com/follow-up",
+                    title="Follow-up validation",
+                    temporal_score=0.9,
+                ),
+            ),
+        )
+        planner = _StaticPlanner(
+            InvestigationPlan(
+                job_id=job.job_id,
+                candidate_explanations=(
+                    InvestigationLead(
+                        label="Lead 1",
+                        hypothesis="Diplomatic signaling deteriorated.",
+                        supporting_signals=("Initial report",),
+                        missing_evidence=("Need confirmation from follow-up reporting.",),
+                        priority="high",
+                    ),
+                ),
+                leading_hypothesis="Diplomatic signaling deteriorated.",
+                follow_up_queries=(
+                    FollowUpQuery(
+                        query="Trump visit China Reuters follow-up",
+                        source_type="web",
+                        reason="Validate the strongest initial lead.",
+                    ),
+                ),
+                skeptical_query=FollowUpQuery(
+                    query="Trump visit China denial",
+                    source_type="x",
+                    reason="Check for direct pushback against the lead explanation.",
+                    skeptical=True,
+                ),
+                assessments=(
+                    HypothesisAssessment(
+                        hypothesis="Diplomatic signaling deteriorated.",
+                        support_level="mixed",
+                        contradictions=("No official confirmation yet.",),
+                        open_uncertainty=("Timing still depends on informal chatter.",),
+                    ),
+                ),
+                needs_more_research=True,
+            )
+        )
+        engine = ResearchEngine(
+            source=source,
+            synthesizer=HeuristicResearchSynthesizer(),
+            planner=planner,
+            provider_name="test",
+            prompt_version="v1",
+        )
+
+        result = engine.investigate_job(job, refresh=True, now=datetime(2026, 3, 25, tzinfo=timezone.utc))
+
+        self.assertEqual(source.search_calls, 1)
+        self.assertEqual(source.follow_up_calls, 1)
+        self.assertEqual(planner.plan_calls, 1)
+        self.assertIsNotNone(result.investigation_plan)
+        assert result.investigation_plan is not None
+        self.assertEqual(result.investigation_plan.leading_hypothesis, "Diplomatic signaling deteriorated.")
+        self.assertEqual(len(result.key_evidence), 2)
+
+    def test_resolution_job_skips_planner_and_follow_up(self) -> None:
+        job = _build_job(job_id="job-resolution", workflow_type="resolution_story")
+        source = _PlannerAwareSource(
+            initial_evidence=(_build_evidence(url="https://example.com/result", title="Resolution report"),),
+            follow_up_evidence=(),
+        )
+        planner = _StaticPlanner(
+            InvestigationPlan(
+                job_id=job.job_id,
+                candidate_explanations=(),
+                leading_hypothesis="",
+                follow_up_queries=(),
+                needs_more_research=False,
+            )
+        )
+        engine = ResearchEngine(
+            source=source,
+            synthesizer=HeuristicResearchSynthesizer(),
+            planner=planner,
+            provider_name="test",
+            prompt_version="v1",
+        )
+
+        result = engine.investigate_job(job, refresh=True, now=datetime(2026, 3, 25, tzinfo=timezone.utc))
+
+        self.assertEqual(source.search_calls, 1)
+        self.assertEqual(source.follow_up_calls, 0)
+        self.assertEqual(planner.plan_calls, 0)
+        self.assertIsNone(result.investigation_plan)
+
+    def test_follow_up_failure_degrades_gracefully_to_first_pass_synthesis(self) -> None:
+        job = _build_job()
+        source = _PlannerAwareSource(
+            initial_evidence=(_build_evidence(url="https://example.com/initial", title="Initial report"),),
+            follow_up_evidence=(),
+            fail_on_follow_up=True,
+        )
+        planner = _StaticPlanner(
+            InvestigationPlan(
+                job_id=job.job_id,
+                candidate_explanations=(
+                    InvestigationLead(
+                        label="Lead 1",
+                        hypothesis="Rumor momentum faded.",
+                        supporting_signals=("Initial report",),
+                        missing_evidence=("Need direct disconfirmation.",),
+                        priority="high",
+                    ),
+                ),
+                leading_hypothesis="Rumor momentum faded.",
+                follow_up_queries=(
+                    FollowUpQuery(
+                        query="Trump visit China follow-up",
+                        source_type="web",
+                        reason="Validate the rumor-fade hypothesis.",
+                    ),
+                ),
+                needs_more_research=True,
+            )
+        )
+        engine = ResearchEngine(
+            source=source,
+            synthesizer=HeuristicResearchSynthesizer(),
+            planner=planner,
+            provider_name="test",
+            prompt_version="v1",
+        )
+
+        result = engine.investigate_job(job, refresh=True, now=datetime(2026, 3, 25, tzinfo=timezone.utc))
+
+        self.assertEqual(result.status, "completed")
+        self.assertIsNone(result.investigation_plan)
+        self.assertEqual(len(result.key_evidence), 1)
+
+    def test_select_follow_up_queries_preserves_skeptical_query_within_budget(self) -> None:
+        plan = InvestigationPlan(
+            job_id="job-1",
+            candidate_explanations=(),
+            leading_hypothesis="Example",
+            follow_up_queries=(
+                FollowUpQuery(query="q1", source_type="web", reason="first"),
+                FollowUpQuery(query="q2", source_type="web", reason="second"),
+                FollowUpQuery(query="q3", source_type="x", reason="third"),
+            ),
+            skeptical_query=FollowUpQuery(
+                query="q-skeptical",
+                source_type="x",
+                reason="disconfirm",
+                skeptical=True,
+            ),
+            needs_more_research=True,
+        )
+
+        selected = select_follow_up_queries(plan, max_queries=3)
+
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[-1].query, "q-skeptical")
+        self.assertTrue(selected[-1].skeptical)
 
 
 class XaiSdkAdapterHelperTests(unittest.TestCase):
@@ -294,6 +506,8 @@ class ResearchStoreTests(unittest.TestCase):
         assert cached is not None
         self.assertTrue(cached.used_cache)
         self.assertEqual(cached.job_id, "job-1")
+        self.assertIsNotNone(cached.investigation_plan)
+        self.assertEqual(cached.key_evidence[0].quality_tier, "primary")
 
     def test_store_prunes_old_versions_per_job_provider(self) -> None:
         job = _build_job()
@@ -363,15 +577,17 @@ class ResearchResultPayloadTests(unittest.TestCase):
         self.assertEqual(payload["processed_jobs"], 1)
         self.assertEqual(payload["story_drafts"][0]["job_id"], "job-1")
         self.assertNotIn("brief_markdown", payload["story_drafts"][0])
+        self.assertIn("investigation_plan", payload["story_drafts"][0])
+        self.assertEqual(payload["story_drafts"][0]["key_evidence"][0]["quality_tier"], "primary")
 
 
-def _build_job(job_id: str = "job-1") -> ResearchJob:
+def _build_job(job_id: str = "job-1", *, workflow_type: str = "repricing_story") -> ResearchJob:
     return ResearchJob(
         job_id=job_id,
         family_key="trump-visit-china",
         family_label="Trump Visit China",
-        workflow_type="repricing_story",
-        story_type_hint="live_repricing",
+        workflow_type=workflow_type,
+        story_type_hint="live_repricing" if workflow_type == "repricing_story" else "resolved_surprise",
         distance_from_extremes=0.22,
         entered_extreme_zone=False,
         editorial_priority_hint="high",
@@ -416,6 +632,19 @@ def _build_job(job_id: str = "job-1") -> ResearchJob:
                         move_since_previous=-0.04,
                     ),
                 ),
+                chart_interval_minutes=60,
+                chart_trace_points=(
+                    PriceTracePoint(
+                        observed_at=datetime(2026, 3, 17, tzinfo=timezone.utc),
+                        probability=0.62,
+                        move_since_previous=None,
+                    ),
+                    PriceTracePoint(
+                        observed_at=datetime(2026, 3, 17, 1, tzinfo=timezone.utc),
+                        probability=0.60,
+                        move_since_previous=-0.02,
+                    ),
+                ),
                 largest_move_window_hours=24,
                 largest_move_window_start=datetime(2026, 3, 23, 9, tzinfo=timezone.utc),
                 largest_move_window_end=datetime(2026, 3, 24, 9, tzinfo=timezone.utc),
@@ -439,6 +668,7 @@ def _build_evidence(
     stance: str = "supporting",
     source_type: str = "web_article",
     author: str = "Reporter",
+    quality_tier: str = "secondary",
 ) -> EvidenceItem:
     return EvidenceItem(
         source_type=source_type,
@@ -452,6 +682,7 @@ def _build_evidence(
         stance=stance,
         excerpt="Short excerpt",
         query="Trump Visit China",
+        quality_tier=quality_tier,
     )
 
 
@@ -472,17 +703,61 @@ def _build_result(job: ResearchJob, *, cache_key: str, completed_at: datetime) -
         price_action_summary="The market sold off sharply over the week after a concentrated 24h move.",
         surprise_assessment="This is a repricing story rather than a resolved outcome.",
         main_narrative="Traders appear to have downgraded the odds after the strongest signals failed to materialize.",
+        belief_shift_drivers=("Diplomatic signaling weakened.", "Rumor momentum faded."),
+        signal_types=("reporting", "social_commentary"),
+        why_now="The move accelerated during the 24h window when the strongest follow-up reporting undercut the earlier narrative.",
         alternative_explanations=("The move may also reflect fading rumor momentum.",),
+        unresolved_points=("It is still unclear whether there was a direct leak or only narrative decay.",),
         note_to_editor="Overlap with broader US-China diplomatic narratives.",
         draft_headline="Trump Visit China: Odds Slide as Narrative Weakens",
         draft_markdown="# Trump Visit China: Odds Slide as Narrative Weakens",
         overlap_group_key=job.overlap_group_key,
         overlap_summary=job.overlap_summary,
         suggested_merge_with=job.suggested_merge_with,
-        key_evidence=(_build_evidence(url="https://example.com/1"),),
+        key_evidence=(
+            _build_evidence(
+                url="https://www.reuters.com/example/1",
+                quality_tier="primary",
+            ),
+        ),
         contradictory_evidence=(),
         open_questions=("Was there a direct leak or only rumor-driven speculation?",),
         completed_at=completed_at,
+        investigation_plan=InvestigationPlan(
+            job_id=job.job_id,
+            candidate_explanations=(
+                InvestigationLead(
+                    label="Lead 1",
+                    hypothesis="Diplomatic signaling weakened.",
+                    supporting_signals=("Diplomatic signaling weakened.",),
+                    missing_evidence=("Need stronger official confirmation.",),
+                    priority="high",
+                ),
+            ),
+            leading_hypothesis="Diplomatic signaling weakened.",
+            follow_up_queries=(
+                FollowUpQuery(
+                    query="Trump visit China Reuters follow-up",
+                    source_type="web",
+                    reason="Validate the lead explanation.",
+                ),
+            ),
+            skeptical_query=FollowUpQuery(
+                query="Trump visit China denial",
+                source_type="x",
+                reason="Look for direct contradiction.",
+                skeptical=True,
+            ),
+            assessments=(
+                HypothesisAssessment(
+                    hypothesis="Diplomatic signaling weakened.",
+                    support_level="mixed",
+                    contradictions=("No official confirmation yet.",),
+                    open_uncertainty=("Timing remains uncertain.",),
+                ),
+            ),
+            needs_more_research=True,
+        ),
     )
 
 
@@ -495,3 +770,58 @@ class _MixedSource(ResearchSource):
         if job.job_id != self.success_job_id:
             raise RuntimeError("synthetic failure")
         return self.evidence
+
+    def search_follow_up(
+        self,
+        job: ResearchJob,
+        query_plan: object,
+        follow_up_queries: tuple[FollowUpQuery, ...],
+    ) -> tuple[EvidenceItem, ...]:
+        return ()
+
+
+class _PlannerAwareSource(ResearchSource):
+    def __init__(
+        self,
+        *,
+        initial_evidence: tuple[EvidenceItem, ...],
+        follow_up_evidence: tuple[EvidenceItem, ...],
+        fail_on_follow_up: bool = False,
+    ) -> None:
+        self.initial_evidence = initial_evidence
+        self.follow_up_evidence = follow_up_evidence
+        self.fail_on_follow_up = fail_on_follow_up
+        self.search_calls = 0
+        self.follow_up_calls = 0
+
+    def search(self, job: ResearchJob, query_plan: object) -> tuple[EvidenceItem, ...]:
+        self.search_calls += 1
+        return self.initial_evidence
+
+    def search_follow_up(
+        self,
+        job: ResearchJob,
+        query_plan: object,
+        follow_up_queries: tuple[FollowUpQuery, ...],
+    ) -> tuple[EvidenceItem, ...]:
+        self.follow_up_calls += 1
+        if self.fail_on_follow_up:
+            raise RuntimeError("synthetic follow-up failure")
+        return self.follow_up_evidence
+
+
+class _StaticPlanner(ResearchPlanner):
+    def __init__(self, plan: InvestigationPlan) -> None:
+        self.plan_result = plan
+        self.plan_calls = 0
+
+    def plan(
+        self,
+        job: ResearchJob,
+        query_plan: object,
+        evidence: tuple[EvidenceItem, ...],
+        *,
+        generated_at: datetime,
+    ) -> InvestigationPlan:
+        self.plan_calls += 1
+        return self.plan_result

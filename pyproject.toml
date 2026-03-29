@@ -5,6 +5,7 @@ description = "Prediction-market repricing monitor for news-intelligence workflo
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.10.8",
     "xai-sdk>=1.10.0",
 ]
 

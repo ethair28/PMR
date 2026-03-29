@@ -45,7 +45,7 @@ def detect_significant_moves(
 
     ranked = sorted(events, key=lambda item: item.composite_score, reverse=True)
     ranked = _attach_related_story_markets(ranked, config=config)
-    return _dedupe_story_families(ranked, config=config)
+    return _select_final_events(ranked, config=config)
 
 
 def evaluate_market_event(
@@ -268,24 +268,98 @@ def _attach_related_story_markets(
     return enriched
 
 
-def _dedupe_story_families(
+def _select_final_events(
     events: Sequence[RepricingEvent],
     *,
     config: MonitoringConfig,
 ) -> list[RepricingEvent]:
+    scored = sorted(
+        (_apply_publication_policy(event, config=config) for event in events),
+        key=lambda item: item.composite_score,
+        reverse=True,
+    )
     limit_per_family = max(config.max_events_per_story_family, 1)
+    limit_per_conflict_root = max(config.max_exact_date_conflict_timing_per_root_cluster, 1)
+    live_repricing_floor = max(config.min_live_repricing_events, 0)
     family_counts: dict[str, int] = {}
+    conflict_root_counts: dict[str, int] = {}
     selected: list[RepricingEvent] = []
+    selected_ids: set[str] = set()
 
-    for event in events:
-        if family_counts.get(event.story_group_key, 0) >= limit_per_family:
+    for event in scored:
+        if event.story_type_hint != "live_repricing":
             continue
-        family_counts[event.story_group_key] = family_counts.get(event.story_group_key, 0) + 1
+        if len(selected) >= min(live_repricing_floor, config.max_events):
+            break
+        if not _can_select_event(
+            event,
+            family_counts=family_counts,
+            conflict_root_counts=conflict_root_counts,
+            limit_per_family=limit_per_family,
+            limit_per_conflict_root=limit_per_conflict_root,
+        ):
+            continue
+        _record_selected_event(
+            event,
+            family_counts=family_counts,
+            conflict_root_counts=conflict_root_counts,
+        )
         selected.append(event)
+        selected_ids.add(event.market.market_id)
+
+    for event in scored:
         if len(selected) >= config.max_events:
             break
+        if event.market.market_id in selected_ids:
+            continue
+        if not _can_select_event(
+            event,
+            family_counts=family_counts,
+            conflict_root_counts=conflict_root_counts,
+            limit_per_family=limit_per_family,
+            limit_per_conflict_root=limit_per_conflict_root,
+        ):
+            continue
+        _record_selected_event(
+            event,
+            family_counts=family_counts,
+            conflict_root_counts=conflict_root_counts,
+        )
+        selected.append(event)
+        selected_ids.add(event.market.market_id)
 
-    return selected
+    return sorted(selected, key=lambda item: item.composite_score, reverse=True)
+
+
+def _apply_publication_policy(
+    event: RepricingEvent,
+    *,
+    config: MonitoringConfig,
+) -> RepricingEvent:
+    notes = list(event.notes)
+    adjusted_score = event.composite_score
+
+    if _is_exact_date_conflict_timing_event(event):
+        adjusted_score -= config.exact_date_conflict_timing_penalty
+        notes.append(
+            "Publication-worthiness penalty applied: exact-date conflict timing markets are deprioritized because they often reflect contract timing mechanics more than PMR-style belief-shift value."
+        )
+        if event.history_mode == "short_history":
+            notes.append(
+                "This market also sits in short-history mode, which makes exact-date conflict timing moves less reliable as publication candidates."
+            )
+
+    if event.story_type_hint == "late_stage_resolution":
+        adjusted_score -= config.late_stage_resolution_penalty
+        notes.append(
+            "Publication-worthiness penalty applied: late-stage resolution stories are deprioritized because they often add less PMR-specific value than clearer surprise stories or unresolved repricing stories."
+        )
+
+    return replace(
+        event,
+        composite_score=adjusted_score,
+        notes=tuple(dict.fromkeys(notes)),
+    )
 
 
 def _entered_extreme_zone(
@@ -324,6 +398,143 @@ def _classify_story_type_hint(
     if close_extreme:
         return "resolved_surprise"
     return "live_repricing"
+
+
+def _is_exact_date_conflict_timing_event(event: RepricingEvent) -> bool:
+    if event.market.category != "geopolitics":
+        return False
+    text = _selection_policy_text(event)
+    if not text:
+        return False
+    return any(re.search(pattern, text) is not None for pattern in _EXACT_DATE_CONFLICT_TIMING_PATTERNS)
+
+
+def _can_select_event(
+    event: RepricingEvent,
+    *,
+    family_counts: dict[str, int],
+    conflict_root_counts: dict[str, int],
+    limit_per_family: int,
+    limit_per_conflict_root: int,
+) -> bool:
+    if family_counts.get(event.story_group_key, 0) >= limit_per_family:
+        return False
+    if _is_exact_date_conflict_timing_event(event):
+        root_key = _exact_date_conflict_root_cluster_key(event)
+        if conflict_root_counts.get(root_key, 0) >= limit_per_conflict_root:
+            return False
+    return True
+
+
+def _record_selected_event(
+    event: RepricingEvent,
+    *,
+    family_counts: dict[str, int],
+    conflict_root_counts: dict[str, int],
+) -> None:
+    family_counts[event.story_group_key] = family_counts.get(event.story_group_key, 0) + 1
+    if _is_exact_date_conflict_timing_event(event):
+        root_key = _exact_date_conflict_root_cluster_key(event)
+        conflict_root_counts[root_key] = conflict_root_counts.get(root_key, 0) + 1
+
+
+def _exact_date_conflict_root_cluster_key(event: RepricingEvent) -> str:
+    text = _selection_policy_text(event)
+    tokens = _normalized_policy_tokens(text)
+    for root_key, terms in _CONFLICT_ROOT_CLUSTERS:
+        if any(token in terms for token in tokens):
+            return root_key
+    geography = _dominant_policy_geography(tokens)
+    if geography is not None:
+        return f"{event.market.category}:{geography}"
+    return f"{event.market.category}:{event.story_group_key}"
+
+
+def _selection_policy_text(event: RepricingEvent) -> str:
+    return " ".join(
+        part
+        for part in (
+            event.market.question,
+            event.market.event_title,
+            event.market.slug,
+            event.market.description,
+        )
+        if part
+    ).lower()
+
+
+def _normalized_policy_tokens(text: str) -> tuple[str, ...]:
+    return tuple(token for token in re.findall(r"[a-z0-9]+", text.lower()) if token)
+
+
+def _dominant_policy_geography(tokens: tuple[str, ...]) -> str | None:
+    counts: dict[str, int] = {}
+    for token in tokens:
+        normalized = _POLICY_GEOGRAPHY_ALIASES.get(token, token)
+        if normalized in _POLICY_GEOGRAPHY_TOKENS:
+            counts[normalized] = counts.get(normalized, 0) + 1
+    if not counts:
+        return None
+    return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+_EXACT_DATE_CONFLICT_TIMING_PATTERNS = (
+    r"\bmilitary action\b.*\b(on|by)\b",
+    r"\bconduct a military action\b.*\b(on|by)\b",
+    r"\btake military action\b.*\b(on|by)\b",
+    r"\bstrike\b.*\b(on|by)\b",
+    r"\battack\b.*\b(on|by)\b",
+)
+
+
+_CONFLICT_ROOT_CLUSTERS = (
+    (
+        "geopolitics:middle_east_conflict",
+        frozenset(
+            {
+                "iran",
+                "israel",
+                "gaza",
+                "lebanon",
+                "hezbollah",
+                "houthi",
+                "houthis",
+                "yemen",
+            }
+        ),
+    ),
+    (
+        "geopolitics:ukraine_russia_conflict",
+        frozenset({"ukraine", "russia"}),
+    ),
+)
+
+
+_POLICY_GEOGRAPHY_ALIASES = {
+    "us": "united_states",
+    "u": "united_states",
+    "s": "united_states",
+    "u.s": "united_states",
+    "u.s.": "united_states",
+    "usa": "united_states",
+    "american": "united_states",
+}
+
+
+_POLICY_GEOGRAPHY_TOKENS = {
+    "china",
+    "denmark",
+    "gaza",
+    "iran",
+    "israel",
+    "lebanon",
+    "russia",
+    "slovenia",
+    "taiwan",
+    "ukraine",
+    "united_states",
+    "yemen",
+}
 
 
 def _select_detection_window_snapshots(

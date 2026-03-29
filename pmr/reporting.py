@@ -29,6 +29,10 @@ def build_markdown_report(
         f"- Minimum open interest: ${config.min_open_interest_usd:,.0f}",
         f"- Full-history scoring: {config.min_history_days_for_full_scoring}+ days",
         f"- Short-history scoring: {config.min_history_days_for_short_scoring} to {config.min_history_days_for_full_scoring - 1} days",
+        f"- Exact-date conflict timing penalty: {config.exact_date_conflict_timing_penalty:.1f} score points",
+        f"- Late-stage resolution penalty: {config.late_stage_resolution_penalty:.1f} score points",
+        f"- Minimum live repricing stories in final slate when available: {config.min_live_repricing_events}",
+        f"- Max exact-date conflict timing stories per root cluster: {config.max_exact_date_conflict_timing_per_root_cluster}",
         "",
     ]
 

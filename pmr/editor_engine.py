@@ -74,10 +74,14 @@ class HeuristicEditorComposer:
                     group_score,
                     ComposedSection(
                         headline=section_headline,
-                        dek=dek,
                         body_markdown=body_markdown,
                         included_job_ids=tuple([primary.job_id, *[item.job_id for item in merge_candidates]]),
                         detail_level=detail_level,
+                        dek=dek,
+                        bottom_line="",
+                        summary_points=(),
+                        primary_chart_job_id=None,
+                        chart_asset_id=None,
                     ),
                 )
             )
@@ -119,16 +123,16 @@ class HeuristicEditorComposer:
         report_title = "PMR Weekly Report"
         report_subtitle = generated_at.strftime("Generated %Y-%m-%d %H:%M UTC")
         if not ordered_sections:
-            editorial_summary = "No story drafts were strong enough to justify inclusion in this weekly report."
-            overall_note = "The editor/composer did not find a sufficiently strong set of stories for publication."
-        else:
-            editorial_summary = (
-                f"Selected {sum(1 for item in decisions if item.action == 'include')} primary stories, "
-                f"merged {sum(1 for item in decisions if item.action == 'merge')} overlaps, and "
-                f"excluded {sum(1 for item in decisions if item.action == 'exclude')} weaker candidates. "
-                "Repricing stories were favored when they offered stronger belief-shift insight than straightforward resolution stories."
+            opening_markdown = (
+                "This week did not produce a strong enough set of stories to justify publication."
             )
-            overall_note = ""
+        else:
+            opening_markdown = (
+                f"This weekly report selects {sum(1 for item in decisions if item.action == 'include')} primary stories, "
+                f"merges {sum(1 for item in decisions if item.action == 'merge')} overlaps, and leaves out "
+                f"{sum(1 for item in decisions if item.action == 'exclude')} weaker candidates. It prioritizes "
+                "stories that best explain changing belief, while still keeping clear surprise stories when they add real calibration value."
+            )
         return WeeklyReport(
             provider=provider_name,
             prompt_version=prompt_version,
@@ -136,8 +140,7 @@ class HeuristicEditorComposer:
             generated_at=generated_at,
             report_title=report_title,
             report_subtitle=report_subtitle,
-            editorial_summary=editorial_summary,
-            overall_note_to_reader=overall_note,
+            opening_markdown=opening_markdown,
             sections=ordered_sections,
             decisions=tuple(decisions),
         )
@@ -342,10 +345,10 @@ def _compress_root_clusters(
         generated_at=report.generated_at,
         report_title=report.report_title,
         report_subtitle=report.report_subtitle,
-        editorial_summary=report.editorial_summary,
-        overall_note_to_reader=report.overall_note_to_reader,
+        opening_markdown=report.opening_markdown,
         sections=compressed_sections,
         decisions=tuple(decisions_by_job.values()),
+        chart_assets=report.chart_assets,
     )
 
 
@@ -389,10 +392,10 @@ def _assign_section_links(
         generated_at=report.generated_at,
         report_title=report.report_title,
         report_subtitle=report.report_subtitle,
-        editorial_summary=report.editorial_summary,
-        overall_note_to_reader=report.overall_note_to_reader,
+        opening_markdown=report.opening_markdown,
         sections=report.sections,
         decisions=tuple(updated_decisions),
+        chart_assets=report.chart_assets,
     )
 
 
@@ -414,10 +417,14 @@ def _promote_top_section(
             updated_sections.append(
                 ComposedSection(
                     headline=section.headline,
-                    dek=section.dek,
                     body_markdown=section.body_markdown,
                     included_job_ids=section.included_job_ids,
                     detail_level="lead",
+                    dek=section.dek,
+                    bottom_line=section.bottom_line,
+                    summary_points=section.summary_points,
+                    primary_chart_job_id=section.primary_chart_job_id,
+                    chart_asset_id=section.chart_asset_id,
                 )
             )
         else:
@@ -429,10 +436,10 @@ def _promote_top_section(
         generated_at=report.generated_at,
         report_title=report.report_title,
         report_subtitle=report.report_subtitle,
-        editorial_summary=report.editorial_summary,
-        overall_note_to_reader=report.overall_note_to_reader,
+        opening_markdown=report.opening_markdown,
         sections=tuple(updated_sections),
         decisions=report.decisions,
+        chart_assets=report.chart_assets,
     )
 
 
@@ -471,8 +478,12 @@ def _merge_section_into_target(target: ComposedSection, extra: ComposedSection) 
     detail_level = "lead" if target.detail_level == "lead" else target.detail_level
     return ComposedSection(
         headline=target.headline,
-        dek=target.dek,
         body_markdown=target.body_markdown.rstrip() + appendix,
         included_job_ids=merged_ids,
         detail_level=detail_level,
+        dek=target.dek,
+        bottom_line=target.bottom_line,
+        summary_points=target.summary_points,
+        primary_chart_job_id=target.primary_chart_job_id,
+        chart_asset_id=target.chart_asset_id,
     )

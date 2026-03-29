@@ -184,6 +184,177 @@ class DetectorTests(unittest.TestCase):
         self.assertEqual(event.story_type_hint, "resolved_surprise")
         self.assertLess(event.distance_from_extremes, 0.1)
 
+    def test_detect_significant_moves_caps_exact_date_conflict_timing_per_root_cluster(self) -> None:
+        markets = (
+            _build_series(
+                market_id="iran-date",
+                category="geopolitics",
+                event_title="Will Iran conduct a military action against Israel on March 23, 2026?",
+                probabilities=(
+                    [0.44, 0.45, 0.44, 0.45] * 15
+                    + [0.48, 0.55, 0.66, 0.81, 0.92, 0.97, 0.99, 1.00]
+                ),
+            ),
+            _build_series(
+                market_id="lebanon-date",
+                category="geopolitics",
+                event_title="Will Israel take military action in Lebanon on March 20, 2026?",
+                probabilities=(
+                    [0.40, 0.41, 0.40, 0.41] * 15
+                    + [0.43, 0.48, 0.60, 0.76, 0.90, 0.97, 1.00, 1.00]
+                ),
+            ),
+            _build_series(
+                market_id="houthi-date",
+                category="geopolitics",
+                event_title="Houthi strike on Israel by March 31, 2026?",
+                probabilities=(
+                    [0.08, 0.08, 0.08, 0.08] * 15
+                    + [0.09, 0.11, 0.14, 0.22, 0.29, 0.31, 0.34, 0.33]
+                ),
+            ),
+            _build_series(
+                market_id="slovenia",
+                category="politics",
+                event_title="Will the Slovenian Democratic Party (SDS) win the most seats in the 2026 Slovenian parliamentary election?",
+                probabilities=(
+                    [0.46, 0.47, 0.45, 0.46] * 15
+                    + [0.47, 0.50, 0.58, 0.72, 0.84, 0.91, 0.96, 0.98]
+                ),
+            ),
+            _build_series(
+                market_id="fed",
+                category="macro",
+                event_title="Will no Fed rate cuts happen in 2026?",
+                probabilities=(
+                    [0.28, 0.29, 0.28, 0.29] * 15
+                    + [0.29, 0.30, 0.32, 0.36, 0.39, 0.41, 0.40, 0.42]
+                ),
+            ),
+        )
+        config = MonitoringConfig(max_events=5)
+
+        events = detect_significant_moves(markets, config)
+        selected_ids = {event.market.market_id for event in events}
+        conflict_ids = {"iran-date", "lebanon-date", "houthi-date"}
+
+        self.assertEqual(len(selected_ids & conflict_ids), 1)
+        self.assertIn("slovenia", selected_ids)
+        self.assertIn("fed", selected_ids)
+
+    def test_selected_exact_date_conflict_timing_story_is_tagged_with_policy_note(self) -> None:
+        markets = (
+            _build_series(
+                market_id="iran-date",
+                category="geopolitics",
+                event_title="Will Iran conduct a military action against Israel on March 23, 2026?",
+                probabilities=(
+                    [0.44, 0.45, 0.44, 0.45] * 15
+                    + [0.48, 0.55, 0.66, 0.81, 0.92, 0.97, 0.99, 1.00]
+                ),
+            ),
+            _build_series(
+                market_id="fed",
+                category="macro",
+                event_title="Will no Fed rate cuts happen in 2026?",
+                probabilities=(
+                    [0.28, 0.29, 0.28, 0.29] * 15
+                    + [0.29, 0.30, 0.32, 0.36, 0.39, 0.41, 0.40, 0.42]
+                ),
+            ),
+        )
+
+        events = detect_significant_moves(markets, BASE_CONFIG)
+        conflict_event = next(event for event in events if event.market.market_id == "iran-date")
+
+        self.assertTrue(
+            any("Publication-worthiness penalty applied" in note for note in conflict_event.notes)
+        )
+
+    def test_detect_significant_moves_reserves_slots_for_live_repricing(self) -> None:
+        markets = (
+            _build_series(
+                market_id="resolved-surprise",
+                category="politics",
+                probabilities=(
+                    [0.46, 0.47, 0.45, 0.46] * 15
+                    + [0.47, 0.50, 0.58, 0.72, 0.84, 0.91, 0.96, 0.98]
+                ),
+            ),
+            _build_series(
+                market_id="late-stage-1",
+                category="geopolitics",
+                probabilities=(
+                    [0.68, 0.69, 0.68, 0.69] * 15
+                    + [0.70, 0.74, 0.79, 0.85, 0.89, 0.92, 0.94, 0.95]
+                ),
+            ),
+            _build_series(
+                market_id="late-stage-2",
+                category="politics",
+                probabilities=(
+                    [0.72, 0.73, 0.72, 0.73] * 15
+                    + [0.74, 0.78, 0.82, 0.87, 0.91, 0.94, 0.96, 0.97]
+                ),
+            ),
+            _build_series(
+                market_id="repricing-1",
+                category="geopolitics",
+                event_title="Will coalition talks shift odds this week?",
+                probabilities=(
+                    [0.30, 0.31, 0.30, 0.31] * 15
+                    + [0.30, 0.31, 0.34, 0.55, 0.37, 0.33, 0.32, 0.33]
+                ),
+            ),
+            _build_series(
+                market_id="repricing-2",
+                category="macro",
+                event_title="Will CPI cool enough to change rate expectations?",
+                probabilities=(
+                    [0.40, 0.41, 0.39, 0.40] * 15
+                    + [0.40, 0.43, 0.47, 0.52, 0.55, 0.57, 0.56, 0.58]
+                ),
+            ),
+        )
+        config = MonitoringConfig(
+            max_events=3,
+            min_live_repricing_events=2,
+            late_stage_resolution_penalty=1.5,
+        )
+
+        events = detect_significant_moves(markets, config)
+        live_repricing_count = sum(1 for event in events if event.story_type_hint == "live_repricing")
+
+        self.assertEqual(len(events), 3)
+        self.assertGreaterEqual(live_repricing_count, 2)
+
+    def test_selected_late_stage_resolution_story_is_tagged_with_policy_note(self) -> None:
+        markets = (
+            _build_series(
+                market_id="late-stage",
+                category="geopolitics",
+                probabilities=(
+                    [0.68, 0.69, 0.68, 0.69] * 15
+                    + [0.70, 0.74, 0.79, 0.85, 0.89, 0.92, 0.94, 0.95]
+                ),
+            ),
+            _build_series(
+                market_id="repricing",
+                category="macro",
+                probabilities=(
+                    [0.40, 0.41, 0.39, 0.40] * 15
+                    + [0.40, 0.43, 0.47, 0.52, 0.55, 0.57, 0.56, 0.58]
+                ),
+            ),
+        )
+
+        events = detect_significant_moves(markets, BASE_CONFIG)
+        late_stage_event = next(event for event in events if event.market.market_id == "late-stage")
+
+        self.assertTrue(
+            any("late-stage resolution stories are deprioritized" in note for note in late_stage_event.notes)
+        )
+
 
 class PipelineTests(unittest.TestCase):
     def test_pipeline_report_is_detector_only(self) -> None:

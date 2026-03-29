@@ -14,6 +14,9 @@ EditorialPriority = Literal["high", "medium", "low"]
 EvidenceSourceType = Literal["x_post", "web_article", "news_article"]
 EvidenceStance = Literal["supporting", "contradictory", "contextual"]
 ResearchStatus = Literal["completed", "insufficient_evidence", "failed"]
+InvestigationQuerySource = Literal["x", "web"]
+HypothesisSupportLevel = Literal["strong", "mixed", "weak"]
+EvidenceQualityTier = Literal["primary", "secondary", "weak_context"]
 EditorDecisionAction = Literal["include", "merge", "exclude"]
 EditorialDetailLevel = Literal["brief", "standard", "extended", "lead"]
 
@@ -158,6 +161,8 @@ class ResearchPriceContext:
 
     interval_hours: int
     trace_points: tuple[PriceTracePoint, ...]
+    chart_interval_minutes: int
+    chart_trace_points: tuple[PriceTracePoint, ...]
     largest_move_window_hours: int
     largest_move_window_start: datetime | None
     largest_move_window_end: datetime | None
@@ -255,6 +260,51 @@ class EvidenceItem:
     stance: EvidenceStance
     excerpt: str
     query: str | None = None
+    quality_tier: EvidenceQualityTier = "secondary"
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigationLead:
+    """A candidate explanation surfaced after the first repricing evidence pass."""
+
+    label: str
+    hypothesis: str
+    supporting_signals: tuple[str, ...]
+    missing_evidence: tuple[str, ...]
+    priority: EditorialPriority
+
+
+@dataclass(frozen=True, slots=True)
+class FollowUpQuery:
+    """A model-proposed follow-up search query for the second repricing pass."""
+
+    query: str
+    source_type: InvestigationQuerySource
+    reason: str
+    skeptical: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class HypothesisAssessment:
+    """Support/uncertainty assessment for a candidate repricing explanation."""
+
+    hypothesis: str
+    support_level: HypothesisSupportLevel
+    contradictions: tuple[str, ...]
+    open_uncertainty: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class InvestigationPlan:
+    """Bounded repricing investigation state between the first and second search passes."""
+
+    job_id: str
+    candidate_explanations: tuple[InvestigationLead, ...]
+    leading_hypothesis: str
+    follow_up_queries: tuple[FollowUpQuery, ...]
+    skeptical_query: FollowUpQuery | None = None
+    assessments: tuple[HypothesisAssessment, ...] = ()
+    needs_more_research: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,7 +326,11 @@ class ResearchResult:
     price_action_summary: str
     surprise_assessment: str
     main_narrative: str
+    belief_shift_drivers: tuple[str, ...]
+    signal_types: tuple[str, ...]
+    why_now: str
     alternative_explanations: tuple[str, ...]
+    unresolved_points: tuple[str, ...]
     note_to_editor: str
     draft_headline: str
     draft_markdown: str
@@ -287,6 +341,7 @@ class ResearchResult:
     contradictory_evidence: tuple[EvidenceItem, ...]
     open_questions: tuple[str, ...]
     completed_at: datetime
+    investigation_plan: InvestigationPlan | None = None
     error_message: str | None = None
     used_cache: bool = False
 
@@ -343,7 +398,11 @@ class EditorStoryPacket:
     price_action_summary: str
     surprise_assessment: str
     main_narrative: str
+    belief_shift_drivers: tuple[str, ...]
+    signal_types: tuple[str, ...]
+    why_now: str
     alternative_explanations: tuple[str, ...]
+    unresolved_points: tuple[str, ...]
     note_to_editor: str
     draft_headline: str
     draft_markdown: str
@@ -369,14 +428,31 @@ class EditorDecision:
 
 
 @dataclass(frozen=True, slots=True)
+class ChartAsset:
+    """Rendered chart asset attached to a weekly report section."""
+
+    asset_id: str
+    job_id: str
+    section_headline: str
+    local_path: str
+    alt_text: str
+    width: int
+    height: int
+
+
+@dataclass(frozen=True, slots=True)
 class ComposedSection:
     """A final weekly report section produced by the editor/composer."""
 
     headline: str
-    dek: str
     body_markdown: str
     included_job_ids: tuple[str, ...]
     detail_level: EditorialDetailLevel
+    dek: str = ""
+    bottom_line: str = ""
+    summary_points: tuple[str, ...] = ()
+    primary_chart_job_id: str | None = None
+    chart_asset_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,10 +465,10 @@ class WeeklyReport:
     generated_at: datetime
     report_title: str
     report_subtitle: str
-    editorial_summary: str
-    overall_note_to_reader: str
+    opening_markdown: str
     sections: tuple[ComposedSection, ...]
     decisions: tuple[EditorDecision, ...]
+    chart_assets: tuple[ChartAsset, ...] = ()
 
     @property
     def included_story_count(self) -> int:

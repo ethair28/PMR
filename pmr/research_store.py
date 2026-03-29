@@ -7,7 +7,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
-from pmr.models import EvidenceItem, ResearchJob, ResearchResult
+from pmr.models import (
+    EvidenceItem,
+    FollowUpQuery,
+    HypothesisAssessment,
+    InvestigationLead,
+    InvestigationPlan,
+    ResearchJob,
+    ResearchResult,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +88,11 @@ class ResearchStore:
             price_action_summary=row["price_action_summary"] or "",
             surprise_assessment=row["surprise_assessment"] or "",
             main_narrative=row["main_narrative"] or "",
+            belief_shift_drivers=tuple(json.loads(row["belief_shift_drivers_json"] or "[]")),
+            signal_types=tuple(json.loads(row["signal_types_json"] or "[]")),
+            why_now=row["why_now"] or "",
             alternative_explanations=tuple(json.loads(row["alternative_explanations_json"] or "[]")),
+            unresolved_points=tuple(json.loads(row["unresolved_points_json"] or "[]")),
             note_to_editor=row["note_to_editor"] or "",
             draft_headline=row["draft_headline"] or "",
             draft_markdown=row["draft_markdown"] or "",
@@ -91,6 +103,7 @@ class ResearchStore:
             contradictory_evidence=contradictory_evidence,
             open_questions=tuple(json.loads(row["open_questions_json"])),
             completed_at=datetime.fromisoformat(row["completed_at"]),
+            investigation_plan=_deserialize_investigation_plan(row["investigation_plan_json"]),
             error_message=row["error_message"],
             used_cache=True,
         )
@@ -119,7 +132,11 @@ class ResearchStore:
                     price_action_summary,
                     surprise_assessment,
                     main_narrative,
+                    belief_shift_drivers_json,
+                    signal_types_json,
+                    why_now,
                     alternative_explanations_json,
+                    unresolved_points_json,
                     note_to_editor,
                     draft_headline,
                     draft_markdown,
@@ -127,11 +144,12 @@ class ResearchStore:
                     overlap_summary,
                     suggested_merge_with_json,
                     open_questions_json,
+                    investigation_plan_json,
                     key_evidence_json,
                     contradictory_evidence_json,
                     completed_at,
                     error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(cache_key) DO UPDATE SET
                     provider = excluded.provider,
                     prompt_version = excluded.prompt_version,
@@ -147,7 +165,11 @@ class ResearchStore:
                     price_action_summary = excluded.price_action_summary,
                     surprise_assessment = excluded.surprise_assessment,
                     main_narrative = excluded.main_narrative,
+                    belief_shift_drivers_json = excluded.belief_shift_drivers_json,
+                    signal_types_json = excluded.signal_types_json,
+                    why_now = excluded.why_now,
                     alternative_explanations_json = excluded.alternative_explanations_json,
+                    unresolved_points_json = excluded.unresolved_points_json,
                     note_to_editor = excluded.note_to_editor,
                     draft_headline = excluded.draft_headline,
                     draft_markdown = excluded.draft_markdown,
@@ -155,6 +177,7 @@ class ResearchStore:
                     overlap_summary = excluded.overlap_summary,
                     suggested_merge_with_json = excluded.suggested_merge_with_json,
                     open_questions_json = excluded.open_questions_json,
+                    investigation_plan_json = excluded.investigation_plan_json,
                     key_evidence_json = excluded.key_evidence_json,
                     contradictory_evidence_json = excluded.contradictory_evidence_json,
                     completed_at = excluded.completed_at,
@@ -177,7 +200,11 @@ class ResearchStore:
                     result.price_action_summary,
                     result.surprise_assessment,
                     result.main_narrative,
+                    json.dumps(list(result.belief_shift_drivers)),
+                    json.dumps(list(result.signal_types)),
+                    result.why_now,
                     json.dumps(list(result.alternative_explanations)),
+                    json.dumps(list(result.unresolved_points)),
                     result.note_to_editor,
                     result.draft_headline,
                     result.draft_markdown,
@@ -185,6 +212,7 @@ class ResearchStore:
                     result.overlap_summary,
                     json.dumps(list(result.suggested_merge_with)),
                     json.dumps(list(result.open_questions)),
+                    _serialize_investigation_plan(result.investigation_plan),
                     json.dumps([_serialize_evidence_item(item) for item in key_evidence]),
                     json.dumps([_serialize_evidence_item(item) for item in contradictory_evidence]),
                     result.completed_at.isoformat(),
@@ -210,8 +238,9 @@ class ResearchStore:
                             temporal_proximity_score,
                             stance,
                             excerpt,
-                            query
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            query,
+                            quality_tier
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             result.cache_key,
@@ -228,6 +257,7 @@ class ResearchStore:
                             item.stance,
                             _truncate(item.excerpt, self.cache_config.max_excerpt_chars),
                             item.query,
+                            item.quality_tier,
                         ),
                     )
             self._prune_versions(connection, job_id=result.job_id, provider=result.provider)
@@ -285,7 +315,11 @@ class ResearchStore:
                 price_action_summary TEXT,
                 surprise_assessment TEXT,
                 main_narrative TEXT,
+                belief_shift_drivers_json TEXT,
+                signal_types_json TEXT,
+                why_now TEXT,
                 alternative_explanations_json TEXT,
+                unresolved_points_json TEXT,
                 note_to_editor TEXT,
                 draft_headline TEXT,
                 draft_markdown TEXT,
@@ -293,6 +327,7 @@ class ResearchStore:
                 overlap_summary TEXT,
                 suggested_merge_with_json TEXT,
                 open_questions_json TEXT NOT NULL,
+                investigation_plan_json TEXT,
                 key_evidence_json TEXT NOT NULL,
                 contradictory_evidence_json TEXT NOT NULL,
                 completed_at TEXT NOT NULL,
@@ -314,6 +349,7 @@ class ResearchStore:
                 stance TEXT NOT NULL,
                 excerpt TEXT NOT NULL,
                 query TEXT,
+                quality_tier TEXT,
                 PRIMARY KEY (cache_key, bucket, slot),
                 FOREIGN KEY (cache_key) REFERENCES research_results(cache_key) ON DELETE CASCADE
             );
@@ -329,6 +365,7 @@ class ResearchStore:
             """
         )
         self._ensure_result_columns(connection)
+        self._ensure_evidence_columns(connection)
 
     def _prune_versions(self, connection: sqlite3.Connection, *, job_id: str, provider: str) -> None:
         rows = connection.execute(
@@ -378,13 +415,18 @@ class ResearchStore:
             "price_action_summary": "TEXT",
             "surprise_assessment": "TEXT",
             "main_narrative": "TEXT",
+            "belief_shift_drivers_json": "TEXT",
+            "signal_types_json": "TEXT",
+            "why_now": "TEXT",
             "alternative_explanations_json": "TEXT",
+            "unresolved_points_json": "TEXT",
             "note_to_editor": "TEXT",
             "draft_headline": "TEXT",
             "draft_markdown": "TEXT",
             "overlap_group_key": "TEXT",
             "overlap_summary": "TEXT",
             "suggested_merge_with_json": "TEXT",
+            "investigation_plan_json": "TEXT",
         }
         for column_name, column_type in required_columns.items():
             if column_name in columns:
@@ -392,6 +434,14 @@ class ResearchStore:
             connection.execute(
                 f"ALTER TABLE research_results ADD COLUMN {column_name} {column_type}"
             )
+
+    def _ensure_evidence_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(research_evidence)").fetchall()
+        }
+        if "quality_tier" not in columns:
+            connection.execute("ALTER TABLE research_evidence ADD COLUMN quality_tier TEXT")
 
 
 def _serialize_evidence_item(item: EvidenceItem) -> dict[str, object]:
@@ -407,7 +457,106 @@ def _serialize_evidence_item(item: EvidenceItem) -> dict[str, object]:
         "stance": item.stance,
         "excerpt": _truncate(item.excerpt, 2_000),
         "query": item.query,
+        "quality_tier": item.quality_tier,
     }
+
+
+def _serialize_investigation_plan(plan: InvestigationPlan | None) -> str | None:
+    if plan is None:
+        return None
+    payload = {
+        "job_id": plan.job_id,
+        "leading_hypothesis": plan.leading_hypothesis,
+        "needs_more_research": plan.needs_more_research,
+        "candidate_explanations": [
+            {
+                "label": item.label,
+                "hypothesis": item.hypothesis,
+                "supporting_signals": list(item.supporting_signals),
+                "missing_evidence": list(item.missing_evidence),
+                "priority": item.priority,
+            }
+            for item in plan.candidate_explanations
+        ],
+        "follow_up_queries": [
+            {
+                "query": item.query,
+                "source_type": item.source_type,
+                "reason": item.reason,
+                "skeptical": item.skeptical,
+            }
+            for item in plan.follow_up_queries
+        ],
+        "skeptical_query": (
+            {
+                "query": plan.skeptical_query.query,
+                "source_type": plan.skeptical_query.source_type,
+                "reason": plan.skeptical_query.reason,
+                "skeptical": plan.skeptical_query.skeptical,
+            }
+            if plan.skeptical_query is not None
+            else None
+        ),
+        "assessments": [
+            {
+                "hypothesis": item.hypothesis,
+                "support_level": item.support_level,
+                "contradictions": list(item.contradictions),
+                "open_uncertainty": list(item.open_uncertainty),
+            }
+            for item in plan.assessments
+        ],
+    }
+    return json.dumps(payload)
+
+
+def _deserialize_investigation_plan(raw: str | None) -> InvestigationPlan | None:
+    if not raw:
+        return None
+    payload = json.loads(raw)
+    skeptical_query_payload = payload.get("skeptical_query")
+    skeptical_query = None
+    if skeptical_query_payload:
+        skeptical_query = FollowUpQuery(
+            query=skeptical_query_payload["query"],
+            source_type=skeptical_query_payload["source_type"],
+            reason=skeptical_query_payload["reason"],
+            skeptical=bool(skeptical_query_payload.get("skeptical")),
+        )
+    return InvestigationPlan(
+        job_id=payload["job_id"],
+        candidate_explanations=tuple(
+            InvestigationLead(
+                label=item["label"],
+                hypothesis=item["hypothesis"],
+                supporting_signals=tuple(item.get("supporting_signals", ())),
+                missing_evidence=tuple(item.get("missing_evidence", ())),
+                priority=item.get("priority", "medium"),
+            )
+            for item in payload.get("candidate_explanations", ())
+        ),
+        leading_hypothesis=payload.get("leading_hypothesis", ""),
+        follow_up_queries=tuple(
+            FollowUpQuery(
+                query=item["query"],
+                source_type=item["source_type"],
+                reason=item["reason"],
+                skeptical=bool(item.get("skeptical")),
+            )
+            for item in payload.get("follow_up_queries", ())
+        ),
+        skeptical_query=skeptical_query,
+        assessments=tuple(
+            HypothesisAssessment(
+                hypothesis=item["hypothesis"],
+                support_level=item.get("support_level", "mixed"),
+                contradictions=tuple(item.get("contradictions", ())),
+                open_uncertainty=tuple(item.get("open_uncertainty", ())),
+            )
+            for item in payload.get("assessments", ())
+        ),
+        needs_more_research=bool(payload.get("needs_more_research", False)),
+    )
 
 
 def _deserialize_evidence_items(raw: str) -> Sequence[EvidenceItem]:
@@ -425,6 +574,7 @@ def _deserialize_evidence_items(raw: str) -> Sequence[EvidenceItem]:
             stance=item["stance"],
             excerpt=item["excerpt"],
             query=item.get("query"),
+            quality_tier=item.get("quality_tier", "secondary"),
         )
         for item in payload
     )
@@ -443,6 +593,7 @@ def _row_to_evidence_item(row: sqlite3.Row) -> EvidenceItem:
         stance=row["stance"],
         excerpt=row["excerpt"],
         query=row["query"],
+        quality_tier=row["quality_tier"] or "secondary",
     )
 
 

@@ -9,6 +9,10 @@ from typing import Any, Sequence
 from pmr.config import MonitoringConfig
 from pmr.models import (
     EvidenceItem,
+    FollowUpQuery,
+    HypothesisAssessment,
+    InvestigationLead,
+    InvestigationPlan,
     PriceTracePoint,
     RelatedMarket,
     RepricingEvent,
@@ -44,10 +48,20 @@ def build_research_input_payload(
             "min_weekly_range": config.min_weekly_range,
         },
         "research_jobs": [
-            serialize_research_job(event, overlap_assignments=overlap_assignments) for event in events
+            serialize_research_job(
+                event,
+                overlap_assignments=overlap_assignments,
+                feature_interval_minutes=config.feature_interval_minutes,
+            )
+            for event in events
         ],
         "anomalies": [
-            serialize_event_for_research(event, overlap_assignments=overlap_assignments) for event in events
+            serialize_event_for_research(
+                event,
+                overlap_assignments=overlap_assignments,
+                feature_interval_minutes=config.feature_interval_minutes,
+            )
+            for event in events
         ],
     }
 
@@ -56,11 +70,12 @@ def serialize_event_for_research(
     event: RepricingEvent,
     *,
     overlap_assignments: dict[str, dict[str, Any]] | None = None,
+    feature_interval_minutes: int = 60,
 ) -> dict[str, Any]:
     """Serialize one detected anomaly into the shape a research agent needs."""
 
     workflow_type = _workflow_type_from_story_hint(event.story_type_hint)
-    price_context = _build_price_context(event)
+    price_context = _build_price_context(event, feature_interval_minutes=feature_interval_minutes)
     overlap = (overlap_assignments or {}).get(event.story_group_key, _default_overlap_assignment())
     return {
         "market": {
@@ -145,6 +160,7 @@ def serialize_research_job(
     event: RepricingEvent,
     *,
     overlap_assignments: dict[str, dict[str, Any]] | None = None,
+    feature_interval_minutes: int = 60,
 ) -> dict[str, Any]:
     """Serialize one anomaly into a story-oriented research brief."""
 
@@ -170,7 +186,11 @@ def serialize_research_job(
             "why_flagged": _build_why_flagged(event),
             "focus_points": _build_focus_points(event, overlap=overlap),
         },
-        "primary_market": serialize_event_for_research(event, overlap_assignments=overlap_assignments),
+        "primary_market": serialize_event_for_research(
+            event,
+            overlap_assignments=overlap_assignments,
+            feature_interval_minutes=feature_interval_minutes,
+        ),
         "related_markets": [
             {"market_id": market_id, "question": question}
             for market_id, question in zip(event.related_market_ids, event.related_market_questions)
@@ -284,7 +304,11 @@ def serialize_research_result(result: ResearchResult) -> dict[str, Any]:
         "price_action_summary": result.price_action_summary,
         "surprise_assessment": result.surprise_assessment,
         "main_narrative": result.main_narrative,
+        "belief_shift_drivers": list(result.belief_shift_drivers),
+        "signal_types": list(result.signal_types),
+        "why_now": result.why_now,
         "alternative_explanations": list(result.alternative_explanations),
+        "unresolved_points": list(result.unresolved_points),
         "note_to_editor": result.note_to_editor,
         "draft_headline": result.draft_headline,
         "draft_markdown": result.draft_markdown,
@@ -294,6 +318,7 @@ def serialize_research_result(result: ResearchResult) -> dict[str, Any]:
         "key_evidence": [serialize_evidence_item(item) for item in result.key_evidence],
         "contradictory_evidence": [serialize_evidence_item(item) for item in result.contradictory_evidence],
         "open_questions": list(result.open_questions),
+        "investigation_plan": serialize_investigation_plan(result.investigation_plan),
         "completed_at": result.completed_at.isoformat(),
         "error_message": result.error_message,
         "used_cache": result.used_cache,
@@ -315,6 +340,51 @@ def serialize_evidence_item(item: EvidenceItem) -> dict[str, Any]:
         "stance": item.stance,
         "excerpt": item.excerpt,
         "query": item.query,
+        "quality_tier": item.quality_tier,
+    }
+
+
+def serialize_investigation_plan(plan: InvestigationPlan | None) -> dict[str, Any] | None:
+    if plan is None:
+        return None
+    return {
+        "job_id": plan.job_id,
+        "leading_hypothesis": plan.leading_hypothesis,
+        "needs_more_research": plan.needs_more_research,
+        "candidate_explanations": [
+            serialize_investigation_lead(item) for item in plan.candidate_explanations
+        ],
+        "follow_up_queries": [serialize_follow_up_query(item) for item in plan.follow_up_queries],
+        "skeptical_query": serialize_follow_up_query(plan.skeptical_query) if plan.skeptical_query else None,
+        "assessments": [serialize_hypothesis_assessment(item) for item in plan.assessments],
+    }
+
+
+def serialize_investigation_lead(item: InvestigationLead) -> dict[str, Any]:
+    return {
+        "label": item.label,
+        "hypothesis": item.hypothesis,
+        "supporting_signals": list(item.supporting_signals),
+        "missing_evidence": list(item.missing_evidence),
+        "priority": item.priority,
+    }
+
+
+def serialize_follow_up_query(item: FollowUpQuery) -> dict[str, Any]:
+    return {
+        "query": item.query,
+        "source_type": item.source_type,
+        "reason": item.reason,
+        "skeptical": item.skeptical,
+    }
+
+
+def serialize_hypothesis_assessment(item: HypothesisAssessment) -> dict[str, Any]:
+    return {
+        "hypothesis": item.hypothesis,
+        "support_level": item.support_level,
+        "contradictions": list(item.contradictions),
+        "open_uncertainty": list(item.open_uncertainty),
     }
 
 
@@ -323,6 +393,7 @@ def serialize_price_context(context: ResearchPriceContext) -> dict[str, Any]:
 
     return {
         "interval_hours": context.interval_hours,
+        "chart_interval_minutes": context.chart_interval_minutes,
         "largest_move_window_hours": context.largest_move_window_hours,
         "largest_move_window_start": (
             context.largest_move_window_start.isoformat() if context.largest_move_window_start else None
@@ -334,6 +405,7 @@ def serialize_price_context(context: ResearchPriceContext) -> dict[str, Any]:
         "surprise_points": context.surprise_points,
         "surprise_label": context.surprise_label,
         "trace_points": [serialize_price_trace_point(item) for item in context.trace_points],
+        "chart_trace_points": [serialize_price_trace_point(item) for item in context.chart_trace_points],
     }
 
 
@@ -433,11 +505,23 @@ def _parse_price_context(raw: dict[str, Any], market_payload: dict[str, Any]) ->
         )
         for item in raw.get("trace_points", ())
     )
+    chart_trace_points = tuple(
+        PriceTracePoint(
+            observed_at=datetime.fromisoformat(item["observed_at"]),
+            probability=float(item["probability"]),
+            move_since_previous=(
+                float(item["move_since_previous"]) if item.get("move_since_previous") is not None else None
+            ),
+        )
+        for item in raw.get("chart_trace_points", ())
+    )
     if not raw:
         detector = market_payload["detector"]
         return ResearchPriceContext(
             interval_hours=8,
             trace_points=trace_points,
+            chart_interval_minutes=60,
+            chart_trace_points=trace_points,
             largest_move_window_hours=24,
             largest_move_window_start=(
                 datetime.fromisoformat(detector["max_move_timestamp"]) if detector.get("max_move_timestamp") else None
@@ -449,6 +533,8 @@ def _parse_price_context(raw: dict[str, Any], market_payload: dict[str, Any]) ->
     return ResearchPriceContext(
         interval_hours=int(raw.get("interval_hours", 8)),
         trace_points=trace_points,
+        chart_interval_minutes=int(raw.get("chart_interval_minutes", 60)),
+        chart_trace_points=chart_trace_points or trace_points,
         largest_move_window_hours=int(raw.get("largest_move_window_hours", 24)),
         largest_move_window_start=(
             datetime.fromisoformat(raw["largest_move_window_start"])
@@ -581,12 +667,18 @@ def _overlap_theme(tokens: Sequence[str]) -> str:
     return "general"
 
 
-def _build_price_context(event: RepricingEvent) -> ResearchPriceContext:
+def _build_price_context(event: RepricingEvent, *, feature_interval_minutes: int) -> ResearchPriceContext:
     trace_points = _sample_trace_points(
         snapshots=event.series.snapshots,
         start=event.detection_window_start,
         end=event.detection_window_end,
-        interval_hours=8,
+        interval_minutes=8 * 60,
+    )
+    chart_trace_points = _sample_trace_points(
+        snapshots=event.series.snapshots,
+        start=event.detection_window_start,
+        end=event.detection_window_end,
+        interval_minutes=feature_interval_minutes,
     )
     largest_window_hours = 24 if event.max_abs_move_24h >= event.max_abs_move_6h else 6
     largest_move_end = event.max_move_timestamp
@@ -604,6 +696,8 @@ def _build_price_context(event: RepricingEvent) -> ResearchPriceContext:
     return ResearchPriceContext(
         interval_hours=8,
         trace_points=trace_points,
+        chart_interval_minutes=feature_interval_minutes,
+        chart_trace_points=chart_trace_points,
         largest_move_window_hours=largest_window_hours,
         largest_move_window_start=largest_move_start,
         largest_move_window_end=largest_move_end,
@@ -618,10 +712,10 @@ def _sample_trace_points(
     snapshots: Sequence[Any],
     start: datetime,
     end: datetime,
-    interval_hours: int,
+    interval_minutes: int,
 ) -> tuple[PriceTracePoint, ...]:
     selected = []
-    step_seconds = interval_hours * 3600
+    step_seconds = max(1, interval_minutes) * 60
     latest_probability = None
     cursor = 0
     ordered = tuple(sorted(snapshots, key=lambda item: item.observed_at))

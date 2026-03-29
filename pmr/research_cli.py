@@ -11,10 +11,10 @@ from pmr.research_payloads import (
     load_research_jobs_from_file,
 )
 from pmr.research_store import ResearchCacheConfig, ResearchStore
-from pmr.research_xai import XaiResearchSource, XaiResearchSynthesizer
+from pmr.research_xai import XaiRepricingPlanner, XaiResearchSource, XaiResearchSynthesizer
 
 
-PROMPT_VERSION = "pmr_story_development_v1"
+PROMPT_VERSION = "pmr_story_development_v3"
 PROVIDER_NAME = "xai_sdk_story_developer"
 
 
@@ -111,6 +111,7 @@ def main() -> int:
     engine = ResearchEngine(
         source=XaiResearchSource.from_env(),
         synthesizer=XaiResearchSynthesizer.from_env(),
+        planner=XaiRepricingPlanner.from_env(),
         provider_name=PROVIDER_NAME,
         prompt_version=PROMPT_VERSION,
         store=store,

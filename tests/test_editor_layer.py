@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
+from pmr.chart_renderer import build_chart_manifest_payload, render_report_charts
 from pmr.editor_engine import EditorEngine, HeuristicEditorComposer
 from pmr.editor_payloads import build_weekly_report_payload, load_editor_story_packets_from_payloads
 from pmr.editor_reporting import render_editor_decisions_markdown, render_weekly_report_markdown
+from pmr.packaging import package_weekly_report
 from pmr.models import (
     EditorStoryPacket,
     EvidenceItem,
@@ -29,7 +33,9 @@ class EditorPayloadTests(unittest.TestCase):
         self.assertEqual(packet.family_label, "Trump Visit China")
         self.assertEqual(packet.primary_market.question, "Will Trump visit China by April 30?")
         self.assertEqual(packet.primary_market.price_context.interval_hours, 8)
+        self.assertEqual(packet.primary_market.price_context.chart_interval_minutes, 60)
         self.assertEqual(packet.root_cluster_key, "politics:china")
+        self.assertEqual(packet.signal_types, ("reporting", "social_commentary"))
         self.assertEqual(packet.draft_headline, "Trump-Xi thaw")
         self.assertEqual(packet.key_evidence[0].url, "https://example.com/story")
 
@@ -127,6 +133,18 @@ class HeuristicEditorTests(unittest.TestCase):
         self.assertIsNotNone(merged[0].section_headline)
         self.assertIsNotNone(merged[0].section_rank)
 
+    def test_editor_engine_leaves_packaging_to_post_editor_step(self) -> None:
+        packet = _build_packet(job_id="job-1", family_label="Trump Visit China", confidence=0.76)
+        report = EditorEngine(
+            composer=HeuristicEditorComposer(),
+            provider_name="heuristic_editor",
+            prompt_version="v1",
+        ).run((packet,), now=datetime(2026, 3, 28, tzinfo=timezone.utc))
+
+        self.assertTrue(report.opening_markdown)
+        self.assertEqual(report.sections[0].bottom_line, "")
+        self.assertEqual(report.sections[0].summary_points, ())
+
 
 class EditorReportingTests(unittest.TestCase):
     def test_report_and_decision_renderers_use_structured_output(self) -> None:
@@ -136,14 +154,90 @@ class EditorReportingTests(unittest.TestCase):
             provider_name="heuristic_editor",
             prompt_version="v1",
         ).run((packet,), now=datetime(2026, 3, 28, tzinfo=timezone.utc))
+        report = package_weekly_report(report, (packet,))
 
         payload = build_weekly_report_payload(report)
         markdown = render_weekly_report_markdown(report)
         decisions = render_editor_decisions_markdown(report)
 
         self.assertEqual(payload["included_story_count"], 1)
+        self.assertIn("opening_markdown", payload)
+        self.assertNotIn("key_takeaways", payload)
+        self.assertNotIn("x_package", payload)
+        self.assertEqual(report.sections[0].primary_chart_job_id, "job-1")
         self.assertIn("# PMR Weekly Report", markdown)
+        self.assertIn(report.opening_markdown, markdown)
         self.assertIn("Trump Visit China", decisions)
+
+    def test_chart_renderer_builds_asset_and_attaches_to_report_section(self) -> None:
+        packet = _build_packet(job_id="job-1", family_label="Trump Visit China", confidence=0.76)
+        report = EditorEngine(
+            composer=HeuristicEditorComposer(),
+            provider_name="heuristic_editor",
+            prompt_version="v1",
+        ).run((packet,), now=datetime(2026, 3, 28, tzinfo=timezone.utc))
+        report = package_weekly_report(report, (packet,))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rendered = render_report_charts(report, (packet,), output_dir=Path(temp_dir) / "charts")
+            manifest = build_chart_manifest_payload(rendered)
+            markdown = render_weekly_report_markdown(rendered)
+
+        self.assertEqual(len(rendered.chart_assets), 1)
+        self.assertIsNotNone(rendered.sections[0].chart_asset_id)
+        self.assertEqual(manifest["chart_count"], 1)
+        self.assertEqual(rendered.chart_assets[0].asset_id, rendered.sections[0].chart_asset_id)
+        image_line = f"![{rendered.sections[0].headline}]({rendered.chart_assets[0].local_path})"
+        self.assertIn(image_line, markdown)
+        self.assertLess(markdown.index(image_line), markdown.index(rendered.sections[0].body_markdown.strip()))
+
+    def test_chart_renderer_uses_primary_story_for_merged_section(self) -> None:
+        primary = _build_packet(
+            job_id="slovenia-election",
+            family_label="Slovenia Election Winner",
+            story_role_hint="primary",
+            overlap_group_key="politics:slovenia:government",
+            suggested_merge_with=("slovenia-pm",),
+            workflow_type="resolution_story",
+            confidence=0.82,
+        )
+        secondary = _build_packet(
+            job_id="slovenia-pm",
+            family_label="Next Prime Minister of Slovenia",
+            story_role_hint="secondary",
+            overlap_group_key="politics:slovenia:government",
+            suggested_merge_with=("slovenia-election",),
+            workflow_type="repricing_story",
+            confidence=0.68,
+        )
+        report = EditorEngine(
+            composer=HeuristicEditorComposer(),
+            provider_name="heuristic_editor",
+            prompt_version="v1",
+        ).run((primary, secondary), now=datetime(2026, 3, 28, tzinfo=timezone.utc))
+        report = package_weekly_report(report, (primary, secondary))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            rendered = render_report_charts(report, (primary, secondary), output_dir=Path(temp_dir) / "charts")
+
+        self.assertEqual(len(rendered.chart_assets), 1)
+        self.assertEqual(rendered.chart_assets[0].job_id, "slovenia-election")
+        self.assertEqual(rendered.sections[0].primary_chart_job_id, "slovenia-election")
+
+    def test_packaging_does_not_invent_section_prose(self) -> None:
+        packet = _build_packet(job_id="job-1", family_label="Trump Visit China", confidence=0.76)
+        report = EditorEngine(
+            composer=HeuristicEditorComposer(),
+            provider_name="heuristic_editor",
+            prompt_version="v1",
+        ).run((packet,), now=datetime(2026, 3, 28, tzinfo=timezone.utc))
+
+        packaged = package_weekly_report(report, (packet,))
+
+        self.assertEqual(packaged.opening_markdown, report.opening_markdown)
+        self.assertEqual(packaged.sections[0].bottom_line, "")
+        self.assertEqual(packaged.sections[0].summary_points, ())
+        self.assertEqual(packaged.sections[0].body_markdown, report.sections[0].body_markdown)
 
 
 def _sample_research_inputs_payload() -> dict:
@@ -211,6 +305,7 @@ def _sample_research_inputs_payload() -> dict:
                     },
                     "price_context": {
                         "interval_hours": 8,
+                        "chart_interval_minutes": 60,
                         "largest_move_window_hours": 24,
                         "largest_move_window_start": "2026-03-23T09:00:00+00:00",
                         "largest_move_window_end": "2026-03-24T09:00:00+00:00",
@@ -227,6 +322,18 @@ def _sample_research_inputs_payload() -> dict:
                                 "observed_at": "2026-03-17T08:00:00+00:00",
                                 "probability": 0.58,
                                 "move_since_previous": -0.04,
+                            },
+                        ],
+                        "chart_trace_points": [
+                            {
+                                "observed_at": "2026-03-17T00:00:00+00:00",
+                                "probability": 0.62,
+                                "move_since_previous": None,
+                            },
+                            {
+                                "observed_at": "2026-03-17T01:00:00+00:00",
+                                "probability": 0.60,
+                                "move_since_previous": -0.02,
                             },
                         ],
                     },
@@ -263,7 +370,11 @@ def _sample_research_results_payload() -> dict:
                 "price_action_summary": "The market moved down sharply over 24h.",
                 "surprise_assessment": "Not a clean resolution surprise.",
                 "main_narrative": "The market repriced as traders reacted to softer diplomatic signals.",
+                "belief_shift_drivers": ["Softer diplomatic signals", "Delay reporting"],
+                "signal_types": ["reporting", "social_commentary"],
+                "why_now": "The move accelerated when the delay narrative became more explicit in the reporting window.",
                 "alternative_explanations": ["Noise in deadline markets."],
+                "unresolved_points": ["How durable is the thaw?"],
                 "note_to_editor": "Keep if the weekly set is light.",
                 "draft_headline": "Trump-Xi thaw",
                 "draft_markdown": "A real repricing story.",
@@ -344,6 +455,19 @@ def _build_packet(
                     move_since_previous=0.05,
                 ),
             ),
+            chart_interval_minutes=60,
+            chart_trace_points=(
+                PriceTracePoint(
+                    observed_at=datetime(2026, 3, 17, tzinfo=timezone.utc),
+                    probability=0.35,
+                    move_since_previous=None,
+                ),
+                PriceTracePoint(
+                    observed_at=datetime(2026, 3, 17, 1, tzinfo=timezone.utc),
+                    probability=0.36,
+                    move_since_previous=0.01,
+                ),
+            ),
             largest_move_window_hours=24,
             largest_move_window_start=datetime(2026, 3, 23, 0, tzinfo=timezone.utc),
             largest_move_window_end=datetime(2026, 3, 24, 0, tzinfo=timezone.utc),
@@ -380,7 +504,11 @@ def _build_packet(
         price_action_summary="Price moved sharply over the week.",
         surprise_assessment="Moderate surprise." if workflow_type != "repricing_story" else "",
         main_narrative="This is the main narrative for the story.",
+        belief_shift_drivers=("Primary driver.",),
+        signal_types=("reporting",),
+        why_now="The sharpest move lined up with the main reporting window.",
         alternative_explanations=("Alternative angle.",),
+        unresolved_points=("One unresolved point.",),
         note_to_editor="Editor note.",
         draft_headline=family_label,
         draft_markdown="Draft body.",

@@ -10,7 +10,8 @@ The current repository provides a working first pass of that flow:
 2. Detect weekly repricing events that happened anywhere inside the last 7 days.
 3. Export typed story-development jobs for a second-stage Grok-backed workflow.
 4. Run an X-first story-development pass and persist structured story drafts.
-5. Run a batch-level editor/composer pass that decides what to publish, merges overlaps, and writes the weekly report.
+5. Run a batch-level editor/composer pass that decides what to publish, merges overlaps, and structures the weekly package.
+6. Run a deterministic post-editor packaging step that renders the newsletter/X-ready assets from that package.
 
 ## Product Thesis
 
@@ -124,8 +125,9 @@ What is implemented now:
 - A research-input JSON exporter that now emits story-oriented jobs alongside the raw anomaly rows.
 - Per-story price-action packets, including 8-hour traces over the week, largest-move windows, and surprise metrics for resolution stories.
 - Soft overlap hints that flag which weekly candidates may belong in the same editor-level story cluster.
-- A separate Grok-backed story-development runner that consumes those jobs, routes resolution stories and repricing stories differently, caches normalized evidence in bounded SQLite storage, and writes structured story drafts JSON.
-- A separate Grok multi-agent editor/composer layer that consumes the story drafts plus their richer market context, applies batch-level editorial judgment, compresses dense root-event clusters when appropriate, and writes `weekly-report.json`, `final-report.md`, and `editor-decisions.md`.
+- A separate Grok-backed story-development runner that consumes those jobs, keeps resolution stories on a simpler single-pass path, gives repricing stories a bounded two-pass investigative loop, caches normalized evidence in bounded SQLite storage, and writes structured story drafts JSON.
+- A separate Grok multi-agent editor/composer layer that consumes the story drafts plus their richer market context, applies batch-level editorial judgment, compresses dense root-event clusters when appropriate, and writes the canonical `weekly-report.json` plus `editor-decisions.md`.
+- A deterministic post-editor render-prep layer that preserves the editor's authored report structure, assigns one simple 7-day primary-market price chart to each final section, and renders `final-report.md`.
 - A sample-data runner so the pipeline works locally without external credentials.
 - An xAI SDK-backed story worker for X-first live research plus web corroboration.
 
@@ -322,6 +324,10 @@ The story-development quality policy is intentionally asymmetric:
 
 - resolution stories should quantify surprise cleanly and tie it to decisive reporting
 - repricing stories should explain why odds moved, not just summarize the event
+- repricing stories should now explicitly identify belief-shift drivers, classify the signal types that moved the market, explain why the move happened when it did, and state what remains unresolved
+- repricing stories now run through a bounded second-pass investigative loop: a first evidence scan, dynamic lead generation, a small set of model-chosen follow-up searches, and then final synthesis
+- the agent gets freedom to choose the most promising follow-up paths, but the engine keeps that autonomy bounded with hard limits on search rounds and follow-up queries
+- normalized evidence now carries a soft quality tier (`primary`, `secondary`, `weak_context`) so the story worker can prefer stronger support without being forced into an overly rigid or overly cautious rubric
 - market-commentary posts and tertiary sources are weaker evidence than direct reporting, official statements, or clearly relevant local coverage
 
 The story-development cache is explicitly bounded:
@@ -334,7 +340,7 @@ The story-development cache is explicitly bounded:
 
 ## Run The Editor/Composer Layer
 
-The editor/composer stage is the first layer that turns the structured story drafts into a final weekly package. It consumes both:
+The editor/composer stage is the first layer that turns the structured story drafts into a coherent weekly package. It consumes both:
 
 - `research-results.json` for the draft stories, evidence, and story-level reasoning
 - `research-inputs.json` for the richer weekly price context and overlap hints
@@ -347,7 +353,9 @@ uv run python -m pmr.editor_cli \
   --input-research-json out/research-inputs.json \
   --output-report-json out/weekly-report.json \
   --output-markdown out/final-report.md \
-  --output-decisions-markdown out/editor-decisions.md
+  --output-decisions-markdown out/editor-decisions.md \
+  --output-chart-manifest-json out/charts/manifest.json \
+  --charts-dir out/charts
 ```
 
 Or with the package script:
@@ -358,13 +366,19 @@ uv run pmr-editor \
   --input-research-json out/research-inputs.json
 ```
 
-This stage now produces three artifacts:
+The CLI runs two steps in sequence:
 
-- `weekly-report.json`: canonical structured editor output
-- `final-report.md`: the reader-facing weekly report
+1. the Grok multi-agent editor/composer, which decides what to include, merge, exclude, and how to structure the sections
+2. a deterministic render-prep step, which leaves the editor's prose intact and only attaches one simple primary-market chart per final section before rendering the final report
+
+The resulting artifacts are:
+
+- `weekly-report.json`: canonical structured weekly package, including the editor-authored opening and final sections
+- `final-report.md`: the sole reader-facing publication artifact
 - `editor-decisions.md`: a separate explanation of inclusion, merge, and exclusion decisions
+- `out/charts/*.png` and `out/charts/manifest.json`: simple 7-day primary-market charts rendered deterministically for the final sections
 
-The editor/composer layer currently assumes the Grok ecosystem and defaults to Grok 4.20 multi-agent with a 4-agent configuration. It is intentionally high-agency:
+The editor/composer layer currently assumes the Grok ecosystem and defaults to Grok 4.20 multi-agent with a 4-agent configuration. It is intentionally high-agency where that matters:
 
 - there is no fixed story quota
 - a weak week can legitimately produce no final stories
@@ -373,8 +387,9 @@ The editor/composer layer currently assumes the Grok ecosystem and defaults to G
 - dense root-event clusters can be compressed so one geopolitical episode does not sprawl into too many adjacent sections
 - more space can be given to stories that carry more user value
 
-The editor prompt explicitly encodes PMR's product thesis so the model is optimizing for the actual report, not a generic newsletter.
+The editor prompt explicitly encodes PMR's product thesis so the model is optimizing for the actual report, not a generic newsletter. The opening of `final-report.md` is editor-authored, charts are deterministic report aids rather than editorial decisions, and the post-editor layer is intentionally non-authorial.
 The editor decision log is also linked back to final section headlines and ranks so editorial choices remain auditable.
+Packaging intentionally stays lower-agency than editing. The model decides the weekly package; deterministic post-processing turns that package into a more scannable report and automatically attaches a simple weekly chart for the primary market in each section. Those charts are intentionally plain: just the market name and the 7-day price action, without highlights, annotations, or embed-specific complexity.
 
 ## JSON Input Shape
 
